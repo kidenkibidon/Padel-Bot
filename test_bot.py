@@ -510,7 +510,49 @@ class DomainTests(unittest.TestCase):
         self.assertIsNone(self.s.session(1))
         self.assertEqual(self.s.user(1)["level"], "C")
 
+    def test_played_count_only_completed_confirmed_and_survives_restart(self):
+        self.s.join(self.eid, 1, "go")
+        self.s.join(self.eid, 2, "go")
+        self.s.join(self.eid, 2, "no")
+        self.s.join(self.eid, 3, "queue")
+        self.assertEqual(self.s.tournaments_played(1), 0)
+        self.s.change_status(999, self.eid, "completed")
+        self.assertEqual(self.s.tournaments_played(1), 1)
+        self.assertEqual(self.s.tournaments_played(2), 0)
+        self.assertEqual(self.s.tournaments_played(3), 0)
+        self.assertEqual(self.s.tournaments_played(4), 0)
+        self.s.tick()
+        restored = Store(self.path, lambda: self.now)
+        self.assertEqual(restored.tournaments_played(1), 1)
+        with self.assertRaises(RuleError):
+            self.s.change_status(999, self.eid, "completed")
+        self.assertEqual(self.s.tournaments_played(1), 1)
+        second = self.s.save_event(999, self.data)
+        self.s.publish(999, second)
+        self.s.join(second, 1, "go")
+        self.s.change_status(999, second, "cancelled")
+        self.assertEqual(self.s.tournaments_played(1), 1)
+        third = self.s.save_event(999, self.data)
+        self.s.publish(999, third)
+        self.s.join(third, 1, "go")
+        self.s.join(third, 1, "go")
+        self.s.change_status(999, third, "completed")
+        self.assertEqual(self.s.tournaments_played(1), 2)
+
+    def test_played_count_on_automatic_completion_and_in_profiles(self):
+        self.s.join(self.eid, 1, "go")
+        self.now = self.data["start"] + self.data["duration"]*60 + 1
+        self.s.tick()
+        self.s.tick()
+        self.assertEqual(self.s.tournaments_played(1), 1)
+        self.app.person(999, 1)
+        self.assertIn("Сыграно турниров: 1", self.api.calls[-1][1]["text"])
+        self.app.callback({"id": "profile", "from": {"id": 1, "first_name": "Player"},
+            "data": "profile", "message": {"chat": {"id": 1, "type": "private"}}})
+        self.assertIn("Сыграно турниров: 1", self.api.calls[-1][1]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

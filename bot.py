@@ -367,6 +367,7 @@ class App:
         if not u:
             raise RuleError("Игрок не найден.")
         text = player(u) + f"\nID: <code>{target}</code>"
+        text += f"\n🎾 Сыграно турниров: {self.s.tournaments_played(target)}"
         rows = [[("Изменить уровень", f"changelevel:{target}")]]
         if u["dm_error"]:
             text += "\n⚠ Личные сообщения не доставлены."
@@ -788,7 +789,8 @@ class App:
             if not u["level"]:
                 self.start_registration(uid)
             else:
-                self.send(uid, player(u) + "\nДля изменения уровня обратитесь к администратору.")
+                self.send(uid, player(u) + f"\n🎾 Сыграно турниров: {self.s.tournaments_played(uid)}"
+                          + "\nДля изменения уровня обратитесь к администратору.")
         elif action == "skip_name":
             s = self.s.session(uid)
             if not s or s["kind"] != "register" or s["step"] != "name":
@@ -1139,4 +1141,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

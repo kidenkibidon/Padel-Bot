@@ -93,6 +93,15 @@ class Store:
             r = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             return dict(r) if r else None
 
+    def tournaments_played(self, uid):
+        """Count confirmed entries in completed events, including existing history."""
+        with self.db() as c:
+            return c.execute("""
+                SELECT count(*) FROM entries en
+                JOIN events e ON e.id=en.event_id
+                WHERE en.user_id=? AND en.status='confirmed' AND e.status='completed'
+            """, (uid,)).fetchone()[0]
+
     def register(self, uid, name, level):
         with self.db() as c:
             c.execute("UPDATE users SET full_name=?,level=? WHERE id=? AND level IS NULL",
@@ -435,4 +444,5 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+
 
