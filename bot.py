@@ -304,7 +304,7 @@ class App:
             [("Создать турнир", "new"), ("Турниры", "admin_events")],
             [("Черновики", "drafts"), ("Корзина", "trash")],
             [("Завершённые / результаты", "completed_events")],
-            [("Копировать турнир", "copy_events")],
+            [("Копировать турнир", "copy_events"), ("Корты / шаблоны", "courts:0")],
             [("Участники", "users:0"), ("Задачи", "tasks")],
             [("Рассылка", "broadcast"), ("Закреп регистрации", "registration_post")],
             [("Настройки", "settings"), ("Как считается рейтинг", "rating_rules")],
@@ -318,6 +318,8 @@ class App:
                      [("Опубликовать", f"publish:{eid}"), ("В корзину", f"trash_draft:{eid}")]]
                     if e["status"] == "draft" else
                     [[("Восстановить", f"restore_draft:{eid}"), ("Удалить навсегда", f"delete_draft:{eid}")]])
+            if e["status"] == "draft":
+                rows.append([("Сохранить корт как шаблон", f"save_court:{eid}")])
             self.send(uid, self.card_text(e), kb(rows))
             return
         if e["status"] == "completed":
@@ -686,7 +688,14 @@ class App:
             return data[key]
         if key == "photo":
             if message.get("photo"):
-                return message["photo"][-1]["file_id"]
+                limit = 2 * 1024 * 1024
+                photos = [p for p in message["photo"] if p.get("file_size") is not None
+                          and p["file_size"] <= limit and max(p["width"], p["height"]) <= 1600]
+                if not photos:
+                    raise RuleError("Нет версии фото до 2 МБ и 1600 px. Пришлите уменьшенное фото как изображение.")
+                photo = max(photos, key=lambda p: p["width"] * p["height"])
+                data["photo_meta"] = {k: photo.get(k) for k in ("file_unique_id", "file_size", "width", "height")}
+                return photo["file_id"]
             if text == "-":
                 return None
             raise RuleError("Пришлите фото как изображение или «-».")
@@ -1118,7 +1127,35 @@ class App:
             self.admin_menu(uid)
         elif a in ("admin_events", "drafts", "trash", "copy_events", "completed_events"):
             self.event_list(uid, a)
-        elif a == "new":
+        elif a in ("new", "courts"):
+            self.pause_wizard(uid)
+            courts = self.s.courts()
+            if a == "new" and not courts:
+                self.wizard_prompt(uid, {"kind": "wizard", "index": 0, "data": {}})
+                return
+            page = int(p[1]) if a == "courts" and len(p) > 1 else 0
+            if page < 0:
+                raise RuleError("Некорректная страница.")
+            rows = [[(r["name"], f"use_court:{r['id']}")] for r in courts[page*8:(page+1)*8]]
+            nav = []
+            if page:
+                nav.append(("←", f"courts:{page-1}"))
+            if (page+1)*8 < len(courts):
+                nav.append(("→", f"courts:{page+1}"))
+            if nav:
+                rows.append(nav)
+            rows.append([("Новый корт / без шаблона", "new_blank")])
+            rows.append([("В админку", "admin")])
+            self.send(uid, "Выберите корт: название, карта и фото подставятся в новый турнир.\n"
+                      "Для нового шаблона заполните эти поля в черновике, затем нажмите «Сохранить корт как шаблон» в карточке черновика.", kb(rows))
+        elif a == "save_court":
+            e = self.s.event(int(p[1]))
+            self.s.save_court(uid, e)
+            self.send(uid, "Корт сохранён в шаблоны. Старые турниры останутся без изменений.")
+        elif a == "use_court":
+            self.pause_wizard(uid)
+            self.wizard_prompt(uid, {"kind": "wizard", "index": 2, "data": self.s.court_data(int(p[1]))})
+        elif a == "new_blank":
             self.pause_wizard(uid)
             self.wizard_prompt(uid, {"kind": "wizard", "index": 0, "data": {}})
         elif a == "ae":
@@ -1382,8 +1419,10 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise SystemExit("Этот бот уже запущен с данной базой.") from None
-    store = Store(db_path)
-    os.chmod(db_path, 0o600)
+    store = Store(db_path, turso_url=os.environ.get("TURSO_DATABASE_URL"),
+                  turso_token=os.environ.get("TURSO_AUTH_TOKEN"))
+    if not store.turso_url:
+        os.chmod(db_path, 0o600)
     if args.check:
         print("Конфигурация и база данных готовы. Соединение с Telegram не проверялось.")
         return

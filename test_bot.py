@@ -296,7 +296,7 @@ class DomainTests(unittest.TestCase):
     def test_full_admin_wizard_to_publication(self):
         self.app.admin_callback(999, ["new"])
         inputs = [
-            {"photo": [{"file_id": "new_photo"}]},
+            {"photo": [{"file_id": "new_photo", "file_size": 100000, "width": 1000, "height": 800}]},
             {"text": "Padel Club"}, {"text": "Americano"}, {"text": "20.01.2030 19:00"},
             {"text": "90"}, {"text": "8"}, {"location": {"latitude": 25.1, "longitude": 55.2}},
             {"text": "150.50"}, {"text": "AED"}, {"text": "Вода и мячи"},

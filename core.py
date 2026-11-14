@@ -1,5 +1,8 @@
 """Domain rules, persistent state, and durable notification queue. No external dependencies."""
 import json
+import os
+import tempfile
+from pathlib import Path
 import sqlite3
 import time
 from datetime import datetime
@@ -31,11 +34,17 @@ class RuleError(Exception):
 
 
 class Store:
-    def __init__(self, path, clock=time.time):
+    def __init__(self, path, clock=time.time, turso_url=None, turso_token=None):
         self.path, self.clock = str(path), clock
+        self.turso_url, self.turso_token = turso_url, turso_token
+        if bool(turso_url) != bool(turso_token):
+            raise ValueError("Нужны обе переменные TURSO_DATABASE_URL и TURSO_AUTH_TOKEN")
         with self.db() as c:
             c.executescript("""
             PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS courts(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+              location TEXT NOT NULL, photo TEXT, updated_at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS users(
               id INTEGER PRIMARY KEY, username TEXT, display TEXT NOT NULL,
               full_name TEXT DEFAULT '', level TEXT, private_started INTEGER DEFAULT 0,
@@ -90,8 +99,12 @@ class Store:
 
     @contextmanager
     def db(self):
-        c = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        c.row_factory = sqlite3.Row
+        if self.turso_url:
+            from storage import Connection
+            c = Connection(self.turso_url, self.turso_token)
+        else:
+            c = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+            c.row_factory = sqlite3.Row
         c.execute("PRAGMA foreign_keys=ON")
         try:
             c.execute("BEGIN IMMEDIATE")
@@ -684,9 +697,56 @@ class Store:
             self.audit(c, actor, "broadcast", [target, len(users)])
             return len(users)
 
+    def save_court(self, actor, data):
+        name = str(data.get("court") or "").strip()
+        location = str(data.get("location") or "")
+        if not name or len(name) > 120 or not location.startswith("https://") or len(location) > 250:
+            raise RuleError("Для шаблона заполните название корта и https-ссылку на карту.")
+        with self.db() as c:
+            cid = c.execute("INSERT INTO courts(name,location,photo,updated_at) VALUES(?,?,?,?)",
+                            (name, location, data.get("photo"), self.clock())).lastrowid
+            self.audit(c, actor, "save_court", cid)
+            return cid
+
+    def courts(self):
+        with self.db() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM courts ORDER BY name,id")]
+
+    def court_data(self, cid):
+        with self.db() as c:
+            r = c.execute("SELECT * FROM courts WHERE id=?", (cid,)).fetchone()
+            if not r:
+                raise RuleError("Шаблон корта не найден.")
+            return dict(court=r["name"], location=r["location"], photo=r["photo"], court_template_id=cid)
+
     def backup(self, target):
-        with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
-            src.backup(dst)
+        if not self.turso_url:
+            with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
+                src.backup(dst)
+            return
+        target = Path(target)
+        fd, temporary = tempfile.mkstemp(prefix=".backup-", dir=target.parent)
+        os.close(fd)
+        try:
+            self._cloud_backup(temporary)
+            os.replace(temporary, target)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _cloud_backup(self, target):
+        with self.db() as src, sqlite3.connect(target) as dst:
+            tables = src.execute("SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+            for table in tables:
+                dst.execute(table["sql"])
+                name = '"' + table["name"].replace('"', '""') + '"'
+                for row in src.execute("SELECT * FROM " + name):
+                    dst.execute("INSERT INTO " + name + " VALUES(" + ",".join("?" for _ in row) + ")", tuple(row.values))
+            for row in src.execute("SELECT name,seq FROM sqlite_sequence"):
+                dst.execute("DELETE FROM sqlite_sequence WHERE name=?", (row[0],))
+                dst.execute("INSERT INTO sqlite_sequence VALUES(?,?)", (row[0], row[1]))
+            for row in src.execute("SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL"):
+                dst.execute(row[0])
 
 
 
