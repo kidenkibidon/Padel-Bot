@@ -8,6 +8,8 @@ import os
 import signal
 import sqlite3
 import time
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta
@@ -807,6 +809,38 @@ def load_env(path):
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+
+def start_health_server():
+    """Expose a minimal HTTP endpoint only when the host supplies PORT."""
+    port = os.environ.get("PORT")
+    if not port:
+        return None
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path not in ("/", "/health"):
+                self.send_error(404)
+                return
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.send_response(200 if self.path in ("/", "/health") else 404)
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    LOG.info("HTTP health server listening on port %s", port)
+    return server
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--check", action="store_true", help="Validate local configuration without Telegram connection")
@@ -858,6 +892,7 @@ def main():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    health_server = start_health_server()
     LOG.info("Bot started: @%s", info["username"])
     last_refresh = 0
     last_backup = 0
@@ -888,6 +923,9 @@ def main():
         except Exception:
             LOG.exception("Unexpected failure; restarting loop")
             time.sleep(3)
+    if health_server is not None:
+        health_server.shutdown()
+        health_server.server_close()
     LOG.info("Stopped cleanly")
 
 
