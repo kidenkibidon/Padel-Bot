@@ -1,0 +1,39 @@
+Offline automated verification — 13 November 2026
+Telegram transport is simulated, no live token or server used.
+
+test_backup_restore_profiles_entries_payment (test_bot.DomainTests.test_backup_restore_profiles_entries_payment) ... ok
+test_broadcast_is_private_and_not_sent_without_confirm (test_bot.DomainTests.test_broadcast_is_private_and_not_sent_without_confirm) ... ok
+test_cancelled_then_rejoined_old_reminder_invalid (test_bot.DomainTests.test_cancelled_then_rejoined_old_reminder_invalid) ... ok
+test_capacity_cannot_shrink_below_occupied (test_bot.DomainTests.test_capacity_cannot_shrink_below_occupied) ... ok
+test_closed_cancelled_completed (test_bot.DomainTests.test_closed_cancelled_completed) ... ok
+test_duplicate_click_not_duplicate_entry (test_bot.DomainTests.test_duplicate_click_not_duplicate_entry) ... ok
+test_full_admin_wizard_to_publication (test_bot.DomainTests.test_full_admin_wizard_to_publication) ... ok
+test_group_action_redirects_privately_without_public_payment (test_bot.DomainTests.test_group_action_redirects_privately_without_public_payment) ... ok
+test_html_escape_and_paginated_roster (test_bot.DomainTests.test_html_escape_and_paginated_roster) ... ok
+test_last_place_concurrency (test_bot.DomainTests.test_last_place_concurrency) ... ok
+test_late_join_no_past_reminders (test_bot.DomainTests.test_late_join_no_past_reminders) ... ok
+test_long_public_lists_fit_and_private_names_remain_complete (test_bot.DomainTests.test_long_public_lists_fit_and_private_names_remain_complete) ... ok
+test_offer_expiry_goes_to_next (test_bot.DomainTests.test_offer_expiry_goes_to_next) ... ok
+test_payment_retained_after_cancellation_private (test_bot.DomainTests.test_payment_retained_after_cancellation_private) ... ok
+test_photo_publication_refresh_does_not_duplicate (test_bot.DomainTests.test_photo_publication_refresh_does_not_duplicate) ... ok
+test_price_edit_keeps_historical_payment_currency_guard (test_bot.DomainTests.test_price_edit_keeps_historical_payment_currency_guard) ... ok
+test_profile_unique_after_username_change (test_bot.DomainTests.test_profile_unique_after_username_change) ... ok
+test_publish_requires_photo_and_future (test_bot.DomainTests.test_publish_requires_photo_and_future) ... ok
+test_ready_queue_confirmation_and_reservation (test_bot.DomainTests.test_ready_queue_confirmation_and_reservation) ... ok
+test_ready_time_not_unsure_time_sets_priority (test_bot.DomainTests.test_ready_time_not_unsure_time_sets_priority) ... ok
+test_registration_flow_with_return_to_event (test_bot.DomainTests.test_registration_flow_with_return_to_event) ... ok
+test_reminder_dedup_after_restart (test_bot.DomainTests.test_reminder_dedup_after_restart) ... ok
+test_reschedule_invalidates_old_reminders (test_bot.DomainTests.test_reschedule_invalidates_old_reminders) ... ok
+test_unauthorized_admin_callbacks_no_mutation (test_bot.DomainTests.test_unauthorized_admin_callbacks_no_mutation) ... ok
+test_unregistered_and_level_constraints (test_bot.DomainTests.test_unregistered_and_level_constraints) ... ok
+test_unsure_not_promoted (test_bot.DomainTests.test_unsure_not_promoted) ... ok
+test_wizard_persists_and_creates_draft (test_bot.DomainTests.test_wizard_persists_and_creates_draft) ... ok
+
+----------------------------------------------------------------------
+Ran 27 tests in 0.466s
+
+OK
+
+Python source compilation: PASS
+Bash installer syntax: PASS
+Local configuration/database smoke check: PASS
