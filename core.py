@@ -491,7 +491,7 @@ class Store:
         if rows:
             c.execute("UPDATE events SET dirty=1 WHERE id=?", (eid,))
 
-    def join(self, eid, uid, choice, force=False, actor=None):
+    def join(self, eid, uid, choice, force=False, actor=None, protect_confirmed=False):
         if choice not in ("go", "queue", "no"):
             raise RuleError("Неизвестный вариант.")
         now = self.clock()
@@ -510,6 +510,8 @@ class Store:
             self._expire(c, eid)
             self._fill(c, eid)
             old = c.execute("SELECT * FROM entries WHERE event_id=? AND user_id=?", (eid, uid)).fetchone()
+            if protect_confirmed and old and old["status"] == "confirmed" and choice in ("no", "queue"):
+                raise RuleError("У вас подтверждённое место. Нажмите кнопку ещё раз: бот предложит подтверждение в личном чате.")
             occupied = c.execute("SELECT count(*) FROM entries WHERE event_id=? AND status IN ('confirmed','offered') AND user_id!=?", (eid, uid)).fetchone()[0]
             if choice == "no":
                 status = "declined"
@@ -626,6 +628,7 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+
 
 
 

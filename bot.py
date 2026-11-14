@@ -183,7 +183,7 @@ class App:
         return text
 
     def event_keyboard(self, eid):
-        return kb([[("Иду", f"go:{eid}"), ("Не иду", f"no:{eid}"), ("Очередь", f"queue:{eid}")],
+        return kb([[("Иду", f"go:{eid}"), ("Не иду", f"no:{eid}"), ("Не уверен", f"queue:{eid}")],
                   [("Списки игроков", f"list:{eid}:0")]])
 
     def roster_text(self, eid, page=0):
@@ -788,7 +788,10 @@ class App:
         if cmd == "/rating":
             if not private and int(self.s.get_setting("group_id", self.group) or 0) != chat:
                 raise RuleError("Рейтинг доступен в подключённой группе или личном чате бота.")
-            self.ranking(chat)
+            if private:
+                self.ranking(uid)
+            elif self.s.user(uid).get("private_started"):
+                self.ranking(uid)
             return
         if not private:
             if cmd == "/bind":
@@ -920,6 +923,84 @@ class App:
         self.send(uid, f"Турнир №{eid}: <b>{LABELS[status]}</b>.",
                   kb([[("Открыть турнир", f"event:{eid}"), ("Меню", "menu")]]))
 
+    def group_answer(self, q, text, alert=False):
+        self.api.call("answerCallbackQuery", callback_query_id=q["id"],
+                      text=text[:200], show_alert=alert, cache_time=0)
+
+    def group_open_private(self, q, parameter):
+        self.api.call("answerCallbackQuery", callback_query_id=q["id"],
+                      url=f"https://t.me/{self.username}?start={parameter}", cache_time=0)
+
+    def group_private_action(self, q, eid, action):
+        """Detailed views and consent stay in DMs, never in the shared group."""
+        uid = q["from"]["id"]
+        parameter = f"e{action}_{eid}" if action in ("go", "no", "queue") else f"eview_{eid}"
+        profile = self.s.user(uid)
+        if not profile or not profile.get("level") or not profile.get("private_started"):
+            self.group_open_private(q, parameter)
+            return
+        try:
+            if action == "list":
+                text, keyboard = self.roster_text(eid)
+                self.send(uid, text, keyboard)
+                notice = "Список игроков отправлен вам в личный чат бота."
+            elif action == "event":
+                self.show_event(uid, eid)
+                notice = "Подробности турнира отправлены вам в личный чат бота."
+            else:
+                self.choice(uid, eid, action)
+                notice = "Подтвердите действие в личном чате бота. Место пока сохраняется."
+        except APIError as exc:
+            if exc.code in (400, 403):
+                # The bot may have been blocked since registration. No consent action happened.
+                self.group_open_private(q, parameter)
+                return
+            raise
+        self.group_answer(q, notice)
+
+    def group_callback(self, q, parts):
+        uid = q["from"]["id"]
+        chat = q.get("message", {}).get("chat", {}).get("id")
+        if not chat or int(self.s.get_setting("group_id", self.group) or 0) != chat:
+            raise RuleError("Эта кнопка доступна только в подключённой группе.")
+        action = parts[0]
+        if action in ("ranking", "profile"):
+            profile = self.s.user(uid)
+            if not profile or not profile.get("level"):
+                self.group_open_private(q, "register")
+                return
+            rating = self.s.rating_profile(uid)
+            lines = [f"Мой Рейтинг 🏆: {rating['rating']:.2f} · {rating.get('level') or '—'}"]
+            if rating["rank"] is not None:
+                lines.append(f"Место в группе: {rating['rank']}")
+            lines.append(f"Сыграно турниров: {self.s.tournaments_played(uid)}")
+            self.group_answer(q, "\n".join(lines), alert=True)
+            return
+        if action not in ("go", "no", "queue", "list", "event"):
+            raise RuleError("Откройте личный чат бота.")
+        eid = int(parts[1])
+        event = self.s.event(eid)
+        if event["status"] in ("draft", "trash"):
+            raise RuleError("Турнир ещё не опубликован.")
+        if action in ("go", "no", "queue") and event["status"] in ("cancelled", "completed"):
+            raise RuleError("Запись на этот турнир недоступна.")
+        profile = self.s.user(uid)
+        if not profile or not profile.get("level") or not profile.get("private_started"):
+            self.group_private_action(q, eid, action)
+            return
+        old = self.s.entry(eid, uid)
+        if action in ("list", "event") or (old and (
+                old["status"] == "confirmed" and action in ("no", "queue") or
+                old["status"] == "offered" and action == "go")):
+            self.group_private_action(q, eid, action)
+            return
+        status = self.s.join(eid, uid, action, protect_confirmed=True)
+        messages = {"confirmed": "✅ Вы записаны на турнир.",
+                    "ready": "Основной состав заполнен. Вы в листе ожидания.",
+                    "unsure": "Вы отметили «Не уверен». Место не зарезервировано.",
+                    "declined": "Вы отметили «Не иду»."}
+        self.group_answer(q, messages[status])
+
     def callback(self, q):
         uid = q["from"]["id"]
         private = q.get("message", {}).get("chat", {}).get("type") == "private"
@@ -931,22 +1012,12 @@ class App:
             self.api.call("answerCallbackQuery", callback_query_id=q["id"])
             self.rating_rules(uid)
             return
-        if action == "ranking":
-            chat = q.get("message", {}).get("chat", {}).get("id")
-            if not chat or (not private and int(self.s.get_setting("group_id", self.group) or 0) != chat):
-                raise RuleError("Откройте рейтинг в подключённой группе или личном чате.")
-            self.api.call("answerCallbackQuery", callback_query_id=q["id"])
-            if action == "ranking":
-                self.ranking(chat, parts[1], int(parts[2]))
-            return
-        # Public buttons never trigger private registration/admin state changes directly.
         if not private:
-            if action not in ("go", "no", "queue", "list", "event"):
-                raise RuleError("Откройте личный чат бота.")
-            eid = int(parts[1])
-            parameter = f"e{action}_{eid}" if action in ("go", "no", "queue") else f"eview_{eid}"
-            self.api.call("answerCallbackQuery", callback_query_id=q["id"],
-                          url=f"https://t.me/{self.username}?start={parameter or 'menu'}")
+            self.group_callback(q, parts)
+            return
+        if action == "ranking":
+            self.api.call("answerCallbackQuery", callback_query_id=q["id"])
+            self.ranking(uid, parts[1], int(parts[2]))
             return
         self.api.call("answerCallbackQuery", callback_query_id=q["id"])
         if action == "wiz":
@@ -1189,6 +1260,11 @@ class App:
                 self.send(m["chat"]["id"], esc(error))
         except APIError as exc:
             LOG.warning("Telegram action failed: %s", exc)
+            if q and not private:
+                try:
+                    self.group_answer(q, "Не удалось показать ответ. Нажмите кнопку ещё раз для проверки.", alert=True)
+                except APIError:
+                    pass
             if uid and private:
                 try:
                     self.send(uid, "Не удалось выполнить действие в Telegram. Повторите позже; сохранённые данные не потеряны.")
@@ -1346,6 +1422,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from core import RuleError, Store, level_for_rating
-from bot import App
+from bot import App, APIError
 
 
 class FakeAPI:
@@ -255,13 +255,14 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(self.s.entry(self.eid, uid)["status"], "confirmed")
         self.assertIsNone(self.s.session(uid))
 
-    def test_group_action_redirects_privately_without_public_payment(self):
+    def test_group_signup_uses_private_popup_without_chat_messages(self):
         self.app.handle({"callback_query": {"id": "q", "from": {"id": 1, "first_name": "P"}, "data": f"go:{self.eid}",
             "message": {"message_id": 10, "chat": {"id": -123, "type": "supergroup"}}}})
         call = self.api.calls[-1]
         self.assertEqual(call[0], "answerCallbackQuery")
-        self.assertIn(f"ego_{self.eid}", call[1]["url"])
-        self.assertIsNone(self.s.entry(self.eid, 1))
+        self.assertIn("Вы записаны", call[1]["text"])
+        self.assertEqual(self.s.entry(self.eid, 1)["status"], "confirmed")
+        self.assertFalse(any(m == "sendMessage" for m,p in self.api.calls))
 
     def test_photo_publication_refresh_does_not_duplicate(self):
         self.app.refresh()
@@ -719,7 +720,8 @@ class DomainTests(unittest.TestCase):
         self.assertIn("Мой Рейтинг 🏆: 2.85", self.api.calls[-1][1]["text"])
         self.app.callback({"id":"q", "from":{"id":1,"first_name":"Player"}, "data":"ranking:all:0",
                            "message":{"chat":{"id":-123,"type":"supergroup"}}})
-        self.assertEqual(self.api.calls[-1][1]["chat_id"], -123)
+        self.assertEqual(self.api.calls[-1][0], "answerCallbackQuery")
+        self.assertTrue(self.api.calls[-1][1]["show_alert"])
         self.assertIn("2.85", self.api.calls[-1][1]["text"])
         with self.assertRaises(RuleError):
             self.app.callback({"id":"q", "from":{"id":1}, "data":"ranking:all:0",
@@ -892,9 +894,105 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(self.api.calls[-1][1]["chat_id"], 999)
         self.assertIn("Как считается", self.api.calls[-1][1]["text"])
 
+    def group_query(self, action, uid=1, chat=-123):
+        return {"id":"group-query", "from":{"id":uid,"first_name":"Player"}, "data":action,
+                "message":{"message_id":10,"chat":{"id":chat,"type":"supergroup"}}}
+
+    def test_quiet_full_waitlist_duplicate_signup_and_unsure(self):
+        self.fill()
+        self.app.callback(self.group_query(f"go:{self.eid}", 5))
+        self.assertEqual(self.s.entry(self.eid, 5)["status"], "ready")
+        self.assertIn("листе ожидания", self.api.calls[-1][1]["text"])
+        self.app.callback(self.group_query(f"go:{self.eid}", 5))
+        self.assertEqual(len(self.s.entries(self.eid)), 5)
+        self.app.callback(self.group_query(f"queue:{self.eid}", 6))
+        self.assertEqual(self.s.entry(self.eid, 6)["status"], "unsure")
+        self.assertIn("Не уверен", self.api.calls[-1][1]["text"])
+        self.assertTrue(all(m == "answerCallbackQuery" for m,p in self.api.calls))
+
+    def test_group_confirmed_cancellation_requires_private_consent_keeps_payment(self):
+        self.s.join(self.eid, 1, "go")
+        self.s.paid(999, self.eid, 1, True)
+        self.app.callback(self.group_query(f"no:{self.eid}"))
+        self.assertEqual(self.s.entry(self.eid, 1)["status"], "confirmed")
+        sends = [p for m,p in self.api.calls if m == "sendMessage"]
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0]["chat_id"], 1)
+        self.assertIn("Освободить", sends[0]["text"])
+        self.assertIn("Место пока сохраняется", self.api.calls[-1][1]["text"])
+        self.app.callback({"id":"q", "from":{"id":1}, "data":f"confirm_choice:{self.eid}:no",
+                           "message":{"message_id":1,"chat":{"id":1,"type":"private"}}})
+        self.assertEqual(self.s.entry(self.eid, 1)["status"], "declined")
+        self.assertEqual(self.s.entry(self.eid, 1)["paid"], 1)
+        self.assertFalse(any(m == "sendMessage" and p["chat_id"]==-123 for m,p in self.api.calls))
+
+    def test_unregistered_group_click_opens_registration_without_changing_entry(self):
+        self.app.callback(self.group_query(f"go:{self.eid}", 101))
+        self.assertIsNone(self.s.entry(self.eid, 101))
+        self.assertIn(f"ego_{self.eid}", self.api.calls[-1][1]["url"])
+        self.assertFalse(any(m == "sendMessage" for m,p in self.api.calls))
+        self.app.callback(self.group_query("ranking:all:0", 101))
+        self.assertIn("start=register", self.api.calls[-1][1]["url"])
+
+    def test_group_roster_only_sent_privately_and_popup_rating_has_no_chat_output(self):
+        self.s.join(self.eid, 1, "go")
+        self.s.paid(999, self.eid, 1, True)
+        self.app.callback(self.group_query(f"list:{self.eid}:0"))
+        sends = [p for m,p in self.api.calls if m=="sendMessage"]
+        self.assertEqual([p["chat_id"] for p in sends], [1])
+        self.assertNotIn("Оплачено", sends[0]["text"])
+        self.assertNotIn("paid", sends[0]["text"])
+        self.api.calls.clear()
+        self.app.callback(self.group_query("ranking:all:0"))
+        self.assertEqual(len(self.api.calls), 1)
+        self.assertEqual(self.api.calls[0][0], "answerCallbackQuery")
+        self.assertTrue(self.api.calls[0][1]["show_alert"])
+        self.assertIn("Мой Рейтинг", self.api.calls[0][1]["text"])
+
+    def test_blocked_private_chat_redirect_preserves_confirmed_place(self):
+        self.s.join(self.eid, 1, "go")
+        original = self.api.send
+        def blocked(*args, **kwargs):
+            raise APIError(403, "blocked")
+        self.api.send = blocked
+        try:
+            self.app.callback(self.group_query(f"no:{self.eid}"))
+        finally:
+            self.api.send = original
+        self.assertEqual(self.s.entry(self.eid, 1)["status"], "confirmed")
+        self.assertIn(f"eno_{self.eid}", self.api.calls[-1][1]["url"])
+
+    def test_group_offer_needs_consent_and_outside_group_cannot_mutate(self):
+        self.fill()
+        self.s.join(self.eid, 5, "go")
+        self.s.join(self.eid, 1, "no")
+        self.assertEqual(self.s.entry(self.eid, 5)["status"], "offered")
+        self.app.callback(self.group_query(f"go:{self.eid}", 5))
+        self.assertEqual(self.s.entry(self.eid, 5)["status"], "offered")
+        self.assertTrue(any(m == "sendMessage" and p["chat_id"]==5 for m,p in self.api.calls))
+        with self.assertRaises(RuleError):
+            self.app.callback(self.group_query(f"go:{self.eid}", 6, -999))
+        self.assertIsNone(self.s.entry(self.eid, 6))
+        self.app.handle({"callback_query":self.group_query(f"paid:{self.eid}:5:1", 5)})
+        self.assertEqual(self.s.entry(self.eid, 5)["paid"], 0)
+        self.assertFalse(any(m=="sendMessage" and p["chat_id"]<0 for m,p in self.api.calls))
+
+    def test_atomic_confirmed_place_guard_and_closed_event_popup(self):
+        self.s.join(self.eid, 1, "go")
+        with self.assertRaises(RuleError):
+            self.s.join(self.eid, 1, "no", protect_confirmed=True)
+        self.assertEqual(self.s.entry(self.eid, 1)["status"], "confirmed")
+        self.s.change_status(999, self.eid, "cancelled")
+        self.app.handle({"callback_query":self.group_query(f"go:{self.eid}", 2)})
+        self.assertIsNone(self.s.entry(self.eid, 2))
+        self.assertEqual(self.api.calls[-1][0], "answerCallbackQuery")
+        self.assertIn("недоступна", self.api.calls[-1][1]["text"])
+        self.assertTrue(self.api.calls[-1][1]["show_alert"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
