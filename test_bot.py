@@ -250,7 +250,7 @@ class DomainTests(unittest.TestCase):
                 "data": data, "message": {"message_id": 1, "chat": {"id": uid, "type": "private"}}}})
         msg(f"/start ego_{self.eid}")
         self.assertEqual(self.s.session(uid)["step"], "level")
-        click("level:3")
+        click("level_v2:C")
         self.assertEqual(self.s.user(uid)["level"], "C")
         self.assertEqual(self.s.entry(self.eid, uid)["status"], "confirmed")
         self.assertIsNone(self.s.session(uid))
@@ -299,7 +299,7 @@ class DomainTests(unittest.TestCase):
             {"text": "Padel Club"}, {"text": "Americano"}, {"text": "20.01.2030 19:00"},
             {"text": "90"}, {"text": "8"}, {"location": {"latitude": 25.1, "longitude": 55.2}},
             {"text": "150.50"}, {"text": "AED"}, {"text": "Вода и мячи"},
-            {"text": "C-, C, C+"}, {"text": "-"},
+            {"text": "D+, C, C+"}, {"text": "-"},
         ]
         for payload in inputs:
             self.app.handle({"message": {"from": {"id": 999, "first_name": "Егор"},
@@ -334,7 +334,7 @@ class DomainTests(unittest.TestCase):
         self.app.wizard_callback(uid, parts)
 
     def test_exact_eight_levels(self):
-        self.assertEqual(self.app.levels, ["D", "D+", "C-", "C", "C+", "B-", "B", "B+"])
+        self.assertEqual(self.app.levels, ["D", "D+", "C", "C+", "B-", "B", "B+", "A"])
 
     def test_all_steps_skip_to_incomplete_draft_and_publish_guard(self):
         self.app.admin_callback(999, ["new"])
@@ -356,13 +356,13 @@ class DomainTests(unittest.TestCase):
         self.wiz("level", 0)
         self.assertEqual(self.s.session(999)["token"], old)
         self.wiz("level", 2)
-        self.assertEqual(self.s.session(999)["data"]["levels"], ["D", "C-"])
+        self.assertEqual(self.s.session(999)["data"]["levels"], ["D", "C"])
         self.wiz("level", 0)
         self.wiz("done")
         self.assertEqual(self.s.session(999)["index"], 11)
         with self.assertRaises(RuleError):
             self.app.wizard_callback(999, ["wiz", old, "level", "1"])
-        self.assertEqual(self.s.session(999)["data"]["levels"], ["C-"])
+        self.assertEqual(self.s.session(999)["data"]["levels"], ["C"])
         self.wiz("back")
         self.assertEqual(self.s.session(999)["index"], 10)
 
@@ -659,16 +659,16 @@ class DomainTests(unittest.TestCase):
         self.s.join(self.eid, 1, "go")
         self.s.join(self.eid, 2, "go")
         self.s.change_status(999, self.eid, "completed")
-        self.assertEqual(self.s.rating_profile(1)["rating"], 2.0)
+        self.assertEqual(self.s.rating_profile(1)["rating"], 2.75)
         self.assertEqual(self.s.rating_profile(1)["rated_events"], 0)
         self.assertEqual(self.s.leaderboard(), [])
         self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
-        self.assertAlmostEqual(self.s.rating_profile(1)["rating"], 2.1)
-        self.assertAlmostEqual(self.s.rating_profile(2)["rating"], 1.9)
+        self.assertAlmostEqual(self.s.rating_profile(1)["rating"], 2.85)
+        self.assertAlmostEqual(self.s.rating_profile(2)["rating"], 2.65)
         self.assertEqual(self.s.rating_profile(1)["wins"], 1)
         self.assertEqual(self.s.rating_profile(1)["rank"], 1)
         self.assertEqual(self.s.rating_profile(2)["rank"], 2)
-        self.assertEqual(self.s.rating_profile(3)["rating"], 2.0)
+        self.assertEqual(self.s.rating_profile(3)["rating"], 2.75)
         self.assertIsNone(self.s.rating_profile(3)["rank"])
         self.assertEqual(self.s.rating_profile(3)["rated_events"], 0)
 
@@ -681,11 +681,11 @@ class DomainTests(unittest.TestCase):
         for uid in (1,2):
             self.s.join(second, uid, "go")
         self.s.save_results(999, second, {1:1,2:2}, [1,2], {})
-        self.assertAlmostEqual(self.s.event_rating_changes(second)[1]["before_rating"], 2.1)
+        self.assertAlmostEqual(self.s.event_rating_changes(second)[1]["before_rating"], 2.85)
         self.s.save_results(999, self.eid, {1:2,2:1}, [1,2], {1:1,2:2})
         history = self.s.event_rating_changes(second)
-        self.assertAlmostEqual(history[1]["before_rating"], 1.9)
-        expected = 1.9 + Store.rating_changes({1:1.9,2:2.1}, {1:1,2:2})[1]
+        self.assertAlmostEqual(history[1]["before_rating"], 2.65)
+        expected = 2.65 + Store.rating_changes({1:2.65,2:2.85}, {1:1,2:2})[1]
         self.assertAlmostEqual(self.s.rating_profile(1)["rating"], expected)
         self.assertEqual(self.s.rating_profile(1)["rated_events"], 2)
         self.assertEqual(self.s.rating_profile(1)["wins"], 1)
@@ -705,8 +705,8 @@ class DomainTests(unittest.TestCase):
             self.s.join(second, uid, "go")
         self.s.save_results(999, second, {1:1,2:2}, [1,2], {})
         self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
-        self.assertAlmostEqual(self.s.event_rating_changes(self.eid)[1]["before_rating"], 2.0)
-        self.assertAlmostEqual(self.s.event_rating_changes(second)[1]["before_rating"], 2.1)
+        self.assertAlmostEqual(self.s.event_rating_changes(self.eid)[1]["before_rating"], 2.75)
+        self.assertAlmostEqual(self.s.event_rating_changes(second)[1]["before_rating"], 2.85)
         self.assertEqual(self.s.rating_profile(1)["rated_events"], 2)
 
     def test_rating_ui_profiles_group_access_and_level_filter(self):
@@ -716,11 +716,11 @@ class DomainTests(unittest.TestCase):
         self.s.set_level(999, 2, "B")
         self.assertEqual([r["user_id"] for r in self.s.leaderboard("C")], [1])
         self.app.person(999, 1)
-        self.assertIn("Рейтинг группы: 2.10", self.api.calls[-1][1]["text"])
+        self.assertIn("Рейтинг группы: 2.85", self.api.calls[-1][1]["text"])
         self.app.callback({"id":"q", "from":{"id":1,"first_name":"Player"}, "data":"ranking:all:0",
                            "message":{"chat":{"id":-123,"type":"supergroup"}}})
         self.assertEqual(self.api.calls[-1][1]["chat_id"], -123)
-        self.assertIn("2.10", self.api.calls[-1][1]["text"])
+        self.assertIn("2.85", self.api.calls[-1][1]["text"])
         with self.assertRaises(RuleError):
             self.app.callback({"id":"q", "from":{"id":1}, "data":"ranking:all:0",
                                "message":{"chat":{"id":-999,"type":"supergroup"}}})
@@ -738,12 +738,85 @@ class DomainTests(unittest.TestCase):
             c.execute("DELETE FROM rating_history")
             c.execute("DELETE FROM settings WHERE key='rating_algorithm'")
         restored = Store(self.path, lambda: self.now)
-        self.assertAlmostEqual(restored.rating_profile(1)["rating"], 2.1)
+        self.assertAlmostEqual(restored.rating_profile(1)["rating"], 2.85)
         self.assertEqual(len(restored.event_rating_changes(self.eid)), 2)
+
+    def test_level_start_midpoints_and_registration_cannot_reset_seed(self):
+        mapping = {"D":1.5,"D+":2.25,"C":2.75,"C+":3.25,"B-":4.25,"B":4.25,"B+":5.25,"A":6.5}
+        for uid,(level,value) in enumerate(mapping.items(), start=101):
+            self.s.touch_user({"id":uid,"first_name":level}, True)
+            self.s.register(uid, "", level)
+            self.assertEqual(self.s.rating_profile(uid)["rating"], value)
+            self.assertEqual(self.s.user(uid)["rating_seed"], value)
+            self.s.register(uid, "", "A")
+            self.assertEqual(self.s.user(uid)["level"], level)
+            self.assertEqual(self.s.rating_profile(uid)["rating"], value)
+        with self.assertRaises(RuleError):
+            self.s.register(101, "", "C-")
+
+    def test_level_seeds_used_for_opponent_adjusted_first_tournament(self):
+        self.s.set_level(999, 1, "D")
+        self.s.set_level(999, 2, "B")
+        unrestricted = dict(self.data, levels=[])
+        eid = self.s.save_event(999, unrestricted)
+        self.s.publish(999, eid)
+        for uid in (1,2):
+            self.s.join(eid, uid, "go")
+        self.s.save_results(999, eid, {1:1,2:2}, [1,2], {})
+        history = self.s.event_rating_changes(eid)
+        self.assertEqual(history[1]["before_rating"], 1.5)
+        self.assertEqual(history[2]["before_rating"], 4.25)
+        self.assertGreater(history[1]["delta"], 0.19)
+        # A later letter correction does not reset established competitive history.
+        before = self.s.rating_profile(1)["rating"]
+        self.s.set_level(999, 1, "C")
+        self.assertEqual(self.s.rating_profile(1)["rating"], before)
+        self.assertEqual(self.s.user(1)["rating_seed"], 1.5)
+
+    def test_legacy_level_migration_keeps_c_minus_pending_until_admin_clarifies(self):
+        with self.s.db() as c:
+            c.execute("UPDATE users SET level='C-',rating_seed=NULL WHERE id=1")
+            c.execute("UPDATE users SET rating_seed=NULL WHERE id=2")
+            c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v1"),))
+        migrated = Store(self.path, lambda: self.now)
+        self.assertEqual(migrated.rating_profile(2)["rating"], 2.75)
+        self.assertTrue(migrated.rating_profile(1)["seed_pending"])
+        self.assertEqual(migrated.user(1)["level"], "C-")
+        migrated.set_level(999, 1, "C")
+        self.assertFalse(migrated.rating_profile(1)["seed_pending"])
+        self.assertEqual(migrated.rating_profile(1)["rating"], 2.75)
+        self.assertEqual(Store(self.path, lambda: self.now).user(1)["rating_seed"], 2.75)
+
+    def test_old_registration_level_buttons_rejected_instead_of_reinterpreted(self):
+        uid = 101
+        self.s.touch_user({"id":uid,"first_name":"Player"}, True)
+        self.app.start_registration(uid)
+        q = {"id":"q", "from":{"id":uid,"first_name":"Player"},
+             "data":"level:2", "message":{"chat":{"id":uid,"type":"private"}}}
+        with self.assertRaises(RuleError):
+            self.app.callback(q)
+        self.assertIsNone(self.s.user(uid)["level"])
+        q["data"]="level_v2:C"
+        self.app.callback(q)
+        self.assertEqual(self.s.user(uid)["level"], "C")
+        self.assertEqual(self.s.rating_profile(uid)["rating"], 2.75)
+        with self.assertRaises(RuleError):
+            self.app.admin_callback(999, ["setlevel","101","2"])
+
+    def test_old_database_schema_migrates_once_with_level_seed(self):
+        path = Path(self.tmp.name)/"old.sqlite3"
+        with sqlite3.connect(path) as c:
+            c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY,username TEXT,display TEXT NOT NULL,full_name TEXT DEFAULT '',level TEXT,private_started INTEGER DEFAULT 0,dm_error TEXT DEFAULT '')")
+            c.execute("INSERT INTO users(id,display,level) VALUES(101,'Old player','B+')")
+        migrated = Store(path, lambda: self.now)
+        self.assertEqual(migrated.user(101)["rating_seed"], 5.25)
+        self.assertEqual(migrated.rating_profile(101)["rating"], 5.25)
+        self.assertEqual(Store(path, lambda: self.now).rating_profile(101)["rating"], 5.25)
 
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

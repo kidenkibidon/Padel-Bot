@@ -7,6 +7,10 @@ from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 
 
+LEVEL_START_RATINGS = {"D": 1.50, "D+": 2.25, "C": 2.75, "C+": 3.25,
+                       "B-": 4.25, "B": 4.25, "B+": 5.25, "A": 6.50}
+
+
 class RuleError(Exception):
     pass
 
@@ -54,10 +58,16 @@ class Store:
               id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
               actor INTEGER NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
             """)
-        if self.get_setting("rating_algorithm") != "community-v1":
+        with self.db() as c:
+            columns = {r[1] for r in c.execute("PRAGMA table_info(users)")}
+            if "rating_seed" not in columns:
+                c.execute("ALTER TABLE users ADD COLUMN rating_seed REAL")
+            for level, value in LEVEL_START_RATINGS.items():
+                c.execute("UPDATE users SET rating_seed=? WHERE level=? AND rating_seed IS NULL", (value, level))
+        if self.get_setting("rating_algorithm") != "community-v2-level-seeds":
             with self.db() as c:
                 self._rebuild_ratings(c)
-                c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v1"),))
+                c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v2-level-seeds"),))
 
     @contextmanager
     def db(self):
@@ -118,15 +128,24 @@ class Store:
             """, (uid,)).fetchone()[0]
 
     def register(self, uid, name, level):
+        if level not in LEVEL_START_RATINGS:
+            raise RuleError("Уровень устарел. Откройте /start и выберите актуальный уровень.")
         with self.db() as c:
-            c.execute("UPDATE users SET full_name=?,level=? WHERE id=? AND level IS NULL",
-                      (name, level, uid))
+            c.execute("UPDATE users SET full_name=?,level=?,rating_seed=? WHERE id=? AND level IS NULL",
+                      (name, level, LEVEL_START_RATINGS[level], uid))
 
     def set_level(self, actor, uid, level):
+        if level not in LEVEL_START_RATINGS:
+            raise RuleError("Выберите актуальный уровень из списка.")
         with self.db() as c:
-            if not c.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
+            user = c.execute("SELECT rating_seed FROM users WHERE id=?", (uid,)).fetchone()
+            if not user:
                 raise RuleError("Игрок не найден.")
+            has_results = c.execute("SELECT 1 FROM event_results WHERE user_id=? LIMIT 1", (uid,)).fetchone()
+            if not has_results or user[0] is None:
+                c.execute("UPDATE users SET rating_seed=? WHERE id=?", (LEVEL_START_RATINGS[level], uid))
             c.execute("UPDATE users SET level=? WHERE id=?", (level, uid))
+            self._rebuild_ratings(c)
             c.execute("UPDATE events SET dirty=1 WHERE id IN (SELECT event_id FROM entries WHERE user_id=?)", (uid,))
             self.audit(c, actor, "level", [uid, level])
 
@@ -312,12 +331,13 @@ class Store:
         c.execute("DELETE FROM rating_history")
         c.execute("DELETE FROM player_ratings")
         ratings, counts, wins = {}, {}, {}
+        seeds = {r[0]:r[1] for r in c.execute("SELECT id,rating_seed FROM users WHERE rating_seed IS NOT NULL")}
         events = [self._event(c, r[0]) for r in c.execute(
             "SELECT DISTINCT e.id FROM events e JOIN event_results r ON r.event_id=e.id WHERE e.status='completed'").fetchall()]
         for event in sorted(events, key=lambda e: (e["start"], e["id"])):
             places = {r[0]:r[1] for r in c.execute(
                 "SELECT user_id,place FROM event_results WHERE event_id=? ORDER BY user_id", (event["id"],))}
-            before = {uid: ratings.get(uid, 2.0) for uid in places}
+            before = {uid: ratings.get(uid, seeds.get(uid, 2.0)) for uid in places}
             changes = self.rating_changes(before, places)
             for uid in places:
                 after = before[uid] + changes[uid]
@@ -332,7 +352,11 @@ class Store:
     def rating_profile(self, uid):
         with self.db() as c:
             row = c.execute("SELECT * FROM player_ratings WHERE user_id=?", (uid,)).fetchone()
-            result = dict(row) if row else dict(user_id=uid, rating=2.0, rated_events=0, wins=0)
+            user = c.execute("SELECT level,rating_seed FROM users WHERE id=?", (uid,)).fetchone()
+            seed = user["rating_seed"] if user and user["rating_seed"] is not None else 2.0
+            result = dict(row) if row else dict(user_id=uid, rating=seed, rated_events=0, wins=0)
+            result["seed"] = seed
+            result["seed_pending"] = bool(user and user["level"] and user["rating_seed"] is None)
             last = c.execute("""SELECT h.delta FROM rating_history h JOIN events e ON e.id=h.event_id
                 WHERE h.user_id=? ORDER BY json_extract(e.data,'$.start') DESC,e.id DESC LIMIT 1""", (uid,)).fetchone()
             result["last_delta"] = last[0] if last else 0.0
@@ -568,6 +592,7 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+
 
 
 

@@ -17,11 +17,11 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from core import RuleError, Store
+from core import LEVEL_START_RATINGS, RuleError, Store
 
 LOG = logging.getLogger("padel")
 TZ = ZoneInfo("Asia/Dubai")
-DEFAULT_LEVELS = ["D", "D+", "C-", "C", "C+", "B-", "B", "B+"]
+DEFAULT_LEVELS = list(LEVEL_START_RATINGS)
 LABELS = {"confirmed": "Иду", "ready": "Жду место", "offered": "Предложено место",
           "unsure": "Пока не уверен", "declined": "Не иду"}
 STATUSES = {"draft": "Черновик", "published": "Запись открыта", "closed": "Запись закрыта",
@@ -295,7 +295,7 @@ class App:
 
     def level_prompt(self, uid):
         self.send(uid, "Выберите уровень игры. После регистрации менять его сможет только администрация.",
-                  kb([[(level, f"level:{i}")] for i, level in enumerate(self.levels)]))
+                  kb([[(f"{level} · {LEVEL_START_RATINGS[level]:.2f}", f"level_v2:{level}")] for i, level in enumerate(self.levels)]))
 
     def admin_menu(self, uid):
         self.admin(uid)
@@ -403,6 +403,8 @@ class App:
             delta = rating["last_delta"]
             text += f"\nПоследний турнир: {delta:+.2f}" if abs(delta) >= 0.005 else "\nПоследний турнир: 0.00"
         text += f"\n🏆 Побед: {rating['wins']} · Турниров в рейтинге: {rating['rated_events']}"
+        if rating["seed_pending"]:
+            text += "\n⚠ Уровень C− больше не используется. Обратитесь к администратору для уточнения уровня и стартового рейтинга."
         if rating["rated_events"] < 3:
             text += "\nПредварительный рейтинг: первые 3 турнира."
         return text
@@ -436,13 +438,14 @@ class App:
 
     def rating_rules(self, chat):
         self.send(chat, "<b>Как считается рейтинг группы</b>\n"
-                  "Старт: 2.00. Срока действия и сезонного обнуления нет.\n"
+                  "Старт по уровню: D — 1.50; D+ — 2.25; C — 2.75; C+ — 3.25; B− / B — 4.25; B+ — 5.25; A — 6.50.\n"
+                  "Срока действия и сезонного обнуления нет.\n"
                   "После подтверждения итогов сравнивается ваше место с местами всех соперников и их рейтингами ДО турнира.\n"
                   "Победа над сильными даёт больше, чем победа над равными. Низкое место фаворита списывает больше.\n"
                   "Изменение за один турнир ограничено ±0.20; рейтинг не опускается ниже нуля. Отдельных очков за участие нет.\n"
                   "При одинаковых местах сравнение считается ничьей. Первые 3 турнира рейтинг предварительный.\n"
                   "При исправлении старых результатов пересчитывается вся последующая история, без повторных начислений.\n"
-                  "Уровень D–B+ меняется администратором отдельно. Это внутренний рейтинг сообщества, а не официальная шкала навыка.")
+                  "Уровень D–A меняется администратором отдельно. Это внутренний рейтинг сообщества, а не официальная шкала навыка.")
 
     def results_text(self, eid, places, include_rating=True):
         names = {r["user_id"]: r["display"] for r in self.s.entries(eid)}
@@ -559,6 +562,7 @@ class App:
             prompt = "Окончание записи по Дубаю: ДД.ММ.ГГГГ ЧЧ:ММ. Пропуск — запись до начала игры."
         token = session.get("token") if preserve_token else secrets.token_hex(4)
         session["token"] = token
+        session["level_catalog"] = "v2"
         rows = []
         if key == "levels":
             selected = session["data"].get("levels") or []
@@ -611,6 +615,8 @@ class App:
         if action == "back":
             session["index"] = max(0, session["index"] - 1)
         elif action in ("level", "included"):
+            if action == "level" and session.get("level_catalog") != "v2":
+                raise RuleError("Список уровней обновлён. Откройте черновик в админке заново.")
             options = self.levels if action == "level" else ["Вода", "Соки", "Мячи", "Аренда ракетки"]
             if key != ("levels" if action == "level" else "included"):
                 raise RuleError("Кнопка не относится к текущему шагу.")
@@ -719,7 +725,7 @@ class App:
                                          [{"text": "🏆 Рейтинг группы", "callback_data": "ranking:all:0"}]]}
         key = f"registration_post:{chat}"
         mid = self.s.get_setting(key)
-        text = "🎾 <b>PADEL ESCAPE</b>\nВыберите свой уровень игры D–B+ один раз. Имя берётся из профиля Telegram.\nДалее изменить уровень сможет только администратор.\nНажмите кнопку и затем Start в личном чате бота."
+        text = "🎾 <b>PADEL ESCAPE</b>\nВыберите свой уровень игры D–A один раз. Имя берётся из профиля Telegram.\nДалее изменить уровень сможет только администратор.\nНажмите кнопку и затем Start в личном чате бота."
         if mid:
             try:
                 self.edit("editMessageText", chat_id=chat, message_id=mid, text=text, parse_mode="HTML", reply_markup=keyboard)
@@ -750,7 +756,7 @@ class App:
         keyboard = None
         text = esc(name) + ", добро пожаловать! 🎾"
         if not profile.get("level"):
-            text += "\nВыберите свой уровень игры D–B+ один раз по кнопке ниже."
+            text += "\nВыберите свой уровень игры D–A один раз по кнопке ниже."
             keyboard = {"inline_keyboard": [[{"text": "Выбрать рейтинг", "url": f"https://t.me/{self.username}?start=register"}]]}
         self.send(chat, text, keyboard)
         self.s.setting(key, stamp)
@@ -963,13 +969,15 @@ class App:
             self.s.session(uid, s)
             self.level_prompt(uid)
         elif action == "level":
+            raise RuleError("Список уровней обновлён. Откройте /start и выберите уровень заново.")
+        elif action == "level_v2":
             s = self.s.session(uid)
             if not s or s["kind"] != "register" or s["step"] != "level":
                 raise RuleError("Анкета уже заполнена или кнопка устарела.")
-            index = int(parts[1])
-            if not 0 <= index < len(self.levels):
-                raise RuleError("Неверный уровень.")
-            self.s.register(uid, s.get("name", ""), self.levels[index])
+            level = parts[1]
+            if level not in LEVEL_START_RATINGS:
+                raise RuleError("Выберите актуальный уровень.")
+            self.s.register(uid, "", level)
             self.s.session(uid, clear=True)
             self.send(uid, "Профиль сохранён. Повторная регистрация не потребуется.")
             self.menu(uid)
@@ -1089,12 +1097,13 @@ class App:
             self.person(uid, int(p[2]), int(p[1]))
         elif a == "changelevel":
             target = int(p[1])
-            self.send(uid, "Новый уровень:", kb([[(v, f"setlevel:{target}:{i}")] for i,v in enumerate(self.levels)]))
+            self.send(uid, "Новый уровень:", kb([[(v, f"setlevel_v2:{target}:{v}")] for i,v in enumerate(self.levels)]))
         elif a == "setlevel":
-            index = int(p[2])
-            if not 0 <= index < len(self.levels):
+            raise RuleError("Список уровней обновлён. Откройте карточку игрока заново.")
+        elif a == "setlevel_v2":
+            if p[2] not in LEVEL_START_RATINGS:
                 raise RuleError("Неизвестный уровень.")
-            self.s.set_level(uid, int(p[1]), self.levels[index])
+            self.s.set_level(uid, int(p[1]), p[2])
             self.person(uid, int(p[1]))
         elif a == "paid":
             self.s.paid(uid, int(p[1]), int(p[2]), p[3] == "1")
@@ -1329,6 +1338,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
