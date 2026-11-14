@@ -120,8 +120,9 @@ class App:
     def menu(self, uid):
         rows = [[("Ближайшие турниры", "events"), ("Мои регистрации", "mine")],
                 [("Моя очередь", "waiting"), ("Мой профиль", "profile")],
-                [("🏆 Рейтинг группы", "ranking:all:0"), ("Как считается рейтинг", "rating_rules")]]
+                [("Мой Рейтинг 🏆", "ranking:all:0")]]
         if uid in self.admins:
+            rows.append([("Как считается рейтинг", "rating_rules")])
             rows.append([("Админка", "admin")])
         return self.send(uid, "🎾 <b>PADEL ESCAPE</b>\nВыберите действие:", kb(rows))
 
@@ -294,7 +295,7 @@ class App:
         self.level_prompt(uid)
 
     def level_prompt(self, uid):
-        self.send(uid, "Выберите уровень игры. После регистрации менять его сможет только администрация.",
+        self.send(uid, "Выберите свой стартовый уровень игры. Далее числовой рейтинг и буквенный уровень будут обновляться по результатам турниров.",
                   kb([[(f"{level} · {LEVEL_START_RATINGS[level]:.2f}", f"level_v2:{level}")] for i, level in enumerate(self.levels)]))
 
     def admin_menu(self, uid):
@@ -306,7 +307,7 @@ class App:
             [("Копировать турнир", "copy_events")],
             [("Участники", "users:0"), ("Задачи", "tasks")],
             [("Рассылка", "broadcast"), ("Закреп регистрации", "registration_post")],
-            [("Настройки", "settings")],
+            [("Настройки", "settings"), ("Как считается рейтинг", "rating_rules")],
         ]))
 
     def admin_event(self, uid, eid):
@@ -382,7 +383,7 @@ class App:
         text = player(u) + f"\nID: <code>{target}</code>"
         text += f"\n🎾 Сыграно турниров: {self.s.tournaments_played(target)}"
         text += "\n" + self.rating_profile_text(target)
-        rows = [[("Изменить уровень", f"changelevel:{target}")]]
+        rows = [[("Изменить стартовую самооценку", f"changelevel:{target}")]]
         if u["dm_error"]:
             text += "\n⚠ Личные сообщения не доставлены."
         if eid is not None:
@@ -397,7 +398,8 @@ class App:
 
     def rating_profile_text(self, uid):
         rating = self.s.rating_profile(uid)
-        text = f"⭐ Рейтинг группы: {rating['rating']:.2f}"
+        text = f"Мой Рейтинг 🏆: {rating['rating']:.2f}"
+        text += "\nУровень игры: " + esc(rating.get("level") or "—")
         if rating["rank"] is not None:
             text += f"\n📊 Место в группе: {rating['rank']}"
             delta = rating["last_delta"]
@@ -415,7 +417,7 @@ class App:
         players = self.s.leaderboard(None if level == "all" else level)
         pages = max(1, (len(players)+9)//10)
         page = min(max(page, 0), pages-1)
-        text = [f"<b>🏆 Рейтинг группы · {esc(level) if level != 'all' else 'Все уровни'}</b>",
+        text = [f"<b>Мой Рейтинг 🏆 · {esc(level) if level != 'all' else 'Все уровни'}</b>",
                 f"Страница {page+1}/{pages} · без срока действия"]
         for i, player in enumerate(players[page*10:(page+1)*10], start=page*10+1):
             name = player["display"].replace("@", "＠")[:40]
@@ -433,11 +435,13 @@ class App:
             nav.append(("→", f"ranking:{level}:{page+1}"))
         if nav:
             rows.append(nav)
-        rows.append([("Как считается рейтинг", "rating_rules")])
+        if chat in self.admins:
+            rows.append([("Как считается рейтинг", "rating_rules")])
         self.send(chat, "\n".join(text), kb(rows))
 
     def rating_rules(self, chat):
-        self.send(chat, "<b>Как считается рейтинг группы</b>\n"
+        self.admin(chat)
+        self.send(chat, "<b>Как считается рейтинг</b>\n"
                   "Старт по уровню: D — 1.50; D+ — 2.25; C — 2.75; C+ — 3.25; B — 4.00; B− — 4.50; B+ — 5.25; A — 6.50.\n"
                   "Срока действия и сезонного обнуления нет.\n"
                   "После подтверждения итогов сравнивается ваше место с местами всех соперников и их рейтингами ДО турнира.\n"
@@ -445,7 +449,8 @@ class App:
                   "Изменение за один турнир ограничено ±0.20; рейтинг не опускается ниже нуля. Отдельных очков за участие нет.\n"
                   "При одинаковых местах сравнение считается ничьей. Первые 3 турнира рейтинг предварительный.\n"
                   "При исправлении старых результатов пересчитывается вся последующая история, без повторных начислений.\n"
-                  "Уровень D–A меняется администратором отдельно. Это внутренний рейтинг сообщества, а не официальная шкала навыка.")
+                  "После учтённых турниров буквенный уровень определяется текущим рейтингом автоматически: D ниже 2; D+ от 2; C от 2.5; C+ от 3; B от 4; B− от 4.5; B+ от 5; A от 6.\n"
+                  "В промежутках до следующего порога сохраняется нижняя категория. Это внутренняя шкала сообщества.")
 
     def results_text(self, eid, places, include_rating=True):
         names = {r["user_id"]: r["display"] for r in self.s.entries(eid)}
@@ -722,10 +727,10 @@ class App:
 
     def registration_post(self, chat):
         keyboard = {"inline_keyboard": [[{"text": "Выбрать уровень игры", "url": f"https://t.me/{self.username}?start=register"}],
-                                         [{"text": "🏆 Рейтинг группы", "callback_data": "ranking:all:0"}]]}
+                                         [{"text": "Мой Рейтинг 🏆", "callback_data": "ranking:all:0"}]]}
         key = f"registration_post:{chat}"
         mid = self.s.get_setting(key)
-        text = "🎾 <b>PADEL ESCAPE</b>\nВыберите свой уровень игры D–A один раз. Имя берётся из профиля Telegram.\nДалее изменить уровень сможет только администратор.\nНажмите кнопку и затем Start в личном чате бота."
+        text = "🎾 <b>PADEL ESCAPE</b>\nВыберите свой уровень игры D–A один раз. Имя берётся из профиля Telegram.\nПосле турниров числовой рейтинг и буквенный уровень обновляются автоматически.\nНажмите кнопку и затем Start в личном чате бота."
         if mid:
             try:
                 self.edit("editMessageText", chat_id=chat, message_id=mid, text=text, parse_mode="HTML", reply_markup=keyboard)
@@ -921,15 +926,18 @@ class App:
         self.s.touch_user(q["from"], False)
         parts = q.get("data", "").split(":")
         action = parts[0]
-        if action in ("ranking", "rating_rules"):
+        if action == "rating_rules":
+            self.admin(uid)
+            self.api.call("answerCallbackQuery", callback_query_id=q["id"])
+            self.rating_rules(uid)
+            return
+        if action == "ranking":
             chat = q.get("message", {}).get("chat", {}).get("id")
             if not chat or (not private and int(self.s.get_setting("group_id", self.group) or 0) != chat):
                 raise RuleError("Откройте рейтинг в подключённой группе или личном чате.")
             self.api.call("answerCallbackQuery", callback_query_id=q["id"])
             if action == "ranking":
                 self.ranking(chat, parts[1], int(parts[2]))
-            else:
-                self.rating_rules(chat)
             return
         # Public buttons never trigger private registration/admin state changes directly.
         if not private:
@@ -960,7 +968,7 @@ class App:
             else:
                 self.send(uid, player(u) + f"\n🎾 Сыграно турниров: {self.s.tournaments_played(uid)}"
                           + "\n" + self.rating_profile_text(uid)
-                          + "\nДля изменения уровня обратитесь к администратору.")
+                          + "\nБуквенный уровень обновляется автоматически по текущему рейтингу после учтённых турниров.")
         elif action == "skip_name":
             s = self.s.session(uid)
             if not s or s["kind"] != "register" or s["step"] != "name":
@@ -1051,7 +1059,7 @@ class App:
                 self.s.save_results(uid, session["eid"], {int(k):v for k,v in session["places"].items()},
                                     session["participants"], {int(k):v for k,v in session["previous"].items()})
                 self.s.session(uid, clear=True)
-                self.send(uid, "Результаты сохранены. Турнир завершён, счётчики и рейтинг группы пересчитаны.")
+                self.send(uid, "Результаты сохранены. Турнир завершён, счётчики и рейтинг пересчитаны.")
                 self.admin_event(uid, session["eid"])
         elif a in ("close", "cancel_event"):
             eid = int(p[1])
@@ -1097,7 +1105,7 @@ class App:
             self.person(uid, int(p[2]), int(p[1]))
         elif a == "changelevel":
             target = int(p[1])
-            self.send(uid, "Новый уровень:", kb([[(v, f"setlevel_v2:{target}:{v}")] for i,v in enumerate(self.levels)]))
+            self.send(uid, "Стартовая самооценка. До первого результата она определяет стартовый рейтинг. После учтённых турниров отображаемый уровень определяется числовым рейтингом автоматически:", kb([[(v, f"setlevel_v2:{target}:{v}")] for i,v in enumerate(self.levels)]))
         elif a == "setlevel":
             raise RuleError("Список уровней обновлён. Откройте карточку игрока заново.")
         elif a == "setlevel_v2":
@@ -1287,7 +1295,7 @@ def main():
         {"command": "start", "description": "Меню и регистрация"},
         {"command": "tournaments", "description": "Ближайшие турниры"},
         {"command": "my", "description": "Мои регистрации"},
-        {"command": "rating", "description": "Рейтинг группы"},
+        {"command": "rating", "description": "Мой Рейтинг 🏆"},
         {"command": "admin", "description": "Админка"},
         {"command": "id", "description": "Мой Telegram ID"},
         {"command": "cancel", "description": "Отменить текущий ввод"},
@@ -1338,6 +1346,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

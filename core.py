@@ -11,6 +11,21 @@ LEVEL_START_RATINGS = {"D": 1.50, "D+": 2.25, "C": 2.75, "C+": 3.25,
                        "B-": 4.50, "B": 4.00, "B+": 5.25, "A": 6.50}
 
 
+# Gaps keep the lower category until the next explicit threshold.
+LEVEL_THRESHOLDS = [(0.0, "D"), (2.0, "D+"), (2.5, "C"), (3.0, "C+"),
+                    (4.0, "B"), (4.5, "B-"), (5.0, "B+"), (6.0, "A")]
+
+
+def level_for_rating(value):
+    # Match the two-decimal rating displayed to players at category boundaries.
+    value = round(value, 2)
+    level = "D"
+    for minimum, name in LEVEL_THRESHOLDS:
+        if value + 1e-10 >= minimum:
+            level = name
+    return level
+
+
 class RuleError(Exception):
     pass
 
@@ -120,7 +135,16 @@ class Store:
     def user(self, uid):
         with self.db() as c:
             r = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-            return dict(r) if r else None
+            if not r:
+                return None
+            result = dict(r)
+            result["declared_level"] = result["level"]
+            result["level"] = self._effective_level(c, uid, result["level"])
+            return result
+
+    def _effective_level(self, c, uid, fallback):
+        rating = c.execute("SELECT rating,rated_events FROM player_ratings WHERE user_id=?", (uid,)).fetchone()
+        return level_for_rating(rating["rating"]) if rating and rating["rated_events"] else fallback
 
     def tournaments_played(self, uid):
         """Count confirmed entries in completed events, including existing history."""
@@ -353,6 +377,8 @@ class Store:
         c.executemany("INSERT INTO player_ratings VALUES(?,?,?,?)",
                       [(uid,value,counts[uid],wins[uid]) for uid,value in ratings.items()])
 
+        c.execute("UPDATE events SET dirty=1 WHERE status IN ('published','closed')")
+
     def rating_profile(self, uid):
         with self.db() as c:
             row = c.execute("SELECT * FROM player_ratings WHERE user_id=?", (uid,)).fetchone()
@@ -361,6 +387,7 @@ class Store:
             result = dict(row) if row else dict(user_id=uid, rating=seed, rated_events=0, wins=0)
             result["seed"] = seed
             result["seed_pending"] = bool(user and user["level"] and user["rating_seed"] is None)
+            result["level"] = level_for_rating(result["rating"]) if result["rated_events"] else (user["level"] if user else None)
             last = c.execute("""SELECT h.delta FROM rating_history h JOIN events e ON e.id=h.event_id
                 WHERE h.user_id=? ORDER BY json_extract(e.data,'$.start') DESC,e.id DESC LIMIT 1""", (uid,)).fetchone()
             result["last_delta"] = last[0] if last else 0.0
@@ -370,14 +397,13 @@ class Store:
 
     def leaderboard(self, level=None):
         with self.db() as c:
-            sql = """SELECT r.*,u.display,u.level FROM player_ratings r JOIN users u ON u.id=r.user_id
-                     WHERE r.rated_events>0"""
-            args = ()
-            if level:
-                sql += " AND u.level=?"
-                args = (level,)
-            sql += " ORDER BY r.rating DESC,r.user_id"
-            return [dict(r) for r in c.execute(sql, args)]
+            rows = [dict(r) for r in c.execute("""
+                SELECT r.*,u.display,u.level AS declared_level FROM player_ratings r
+                JOIN users u ON u.id=r.user_id WHERE r.rated_events>0 ORDER BY r.rating DESC,r.user_id
+            """)]
+            for row in rows:
+                row["level"] = level_for_rating(row["rating"])
+            return [row for row in rows if level is None or row["level"] == level]
 
     def event_rating_changes(self, eid):
         with self.db() as c:
@@ -412,10 +438,14 @@ class Store:
 
     def entries(self, eid):
         with self.db() as c:
-            return [dict(r) for r in c.execute("""SELECT en.*,u.username,u.display,u.full_name,u.level,u.dm_error
+            rows = [dict(r) for r in c.execute("""SELECT en.*,u.username,u.display,u.full_name,u.level,u.dm_error
               FROM entries en JOIN users u ON en.user_id=u.id WHERE event_id=?
               ORDER BY CASE status WHEN 'confirmed' THEN 0 WHEN 'offered' THEN 1 WHEN 'ready' THEN 2
               WHEN 'unsure' THEN 3 ELSE 4 END, COALESCE(ready_at,joined_at),user_id""", (eid,))]
+            for row in rows:
+                row["declared_level"] = row["level"]
+                row["level"] = self._effective_level(c, row["user_id"], row["level"])
+            return rows
 
     def entry(self, eid, uid):
         with self.db() as c:
@@ -475,7 +505,7 @@ class Store:
             if choice != "no":
                 if (e["status"] != "published" or now >= min(e["start"], e["close_at"])) and not force:
                     raise RuleError("Запись закрыта.")
-                if e.get("levels") and u["level"] not in e["levels"] and not force:
+                if e.get("levels") and self._effective_level(c, uid, u["level"]) not in e["levels"] and not force:
                     raise RuleError("Ваш уровень не подходит для этого турнира. Обратитесь к администратору.")
             self._expire(c, eid)
             self._fill(c, eid)
@@ -596,6 +626,7 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+
 
 
 

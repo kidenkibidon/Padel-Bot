@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core import RuleError, Store
+from core import RuleError, Store, level_for_rating
 from bot import App
 
 
@@ -714,9 +714,9 @@ class DomainTests(unittest.TestCase):
             self.s.join(self.eid, uid, "go")
         self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
         self.s.set_level(999, 2, "B")
-        self.assertEqual([r["user_id"] for r in self.s.leaderboard("C")], [1])
+        self.assertEqual([r["user_id"] for r in self.s.leaderboard("C")], [1,2])
         self.app.person(999, 1)
-        self.assertIn("Рейтинг группы: 2.85", self.api.calls[-1][1]["text"])
+        self.assertIn("Мой Рейтинг 🏆: 2.85", self.api.calls[-1][1]["text"])
         self.app.callback({"id":"q", "from":{"id":1,"first_name":"Player"}, "data":"ranking:all:0",
                            "message":{"chat":{"id":-123,"type":"supergroup"}}})
         self.assertEqual(self.api.calls[-1][1]["chat_id"], -123)
@@ -832,9 +832,70 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(restarted.rating_profile(1)["rating"], first)
         self.assertEqual(restarted.rating_profile(1)["rated_events"], 1)
 
+    def test_letter_thresholds_gaps_and_display_rounding(self):
+        cases = [(0,"D"),(1.99,"D"),(2.0,"D+"),(2.49,"D+"),(2.5,"C"),
+                 (2.99,"C"),(3.0,"C+"),(3.5,"C+"),(3.99,"C+"),(4.0,"B"),
+                 (4.49,"B"),(4.5,"B-"),(4.99,"B-"),(5.0,"B+"),(5.5,"B+"),
+                 (5.99,"B+"),(6.0,"A"),(8.0,"A"),(2.499,"C")]
+        for rating, expected in cases:
+            self.assertEqual(level_for_rating(rating), expected)
+
+    def test_auto_promotion_demotion_history_and_tournament_eligibility(self):
+        event_ids = []
+        for index in range(4):
+            eid = self.s.save_event(999, dict(self.data, levels=[], start=self.data["start"]+index*86400,
+                                            close_at=self.data["close_at"]+index*86400))
+            self.s.publish(999, eid)
+            for uid in (1,2):
+                self.s.join(eid, uid, "go")
+            self.s.save_results(999, eid, {1:1,2:2}, [1,2], {})
+            event_ids.append(eid)
+        self.assertEqual(self.s.user(1)["level"], "C+")
+        self.assertEqual(self.s.user(1)["declared_level"], "C")
+        self.assertEqual(self.s.rating_profile(1)["level"], "C+")
+        self.assertIn("Уровень игры: C+", self.app.rating_profile_text(1))
+        self.assertEqual(next(r for r in self.s.entries(event_ids[-1]) if r["user_id"]==1)["level"], "C+")
+        next_event = self.s.save_event(999, dict(self.data, levels=["C+"]))
+        self.s.publish(999, next_event)
+        self.assertEqual(self.s.join(next_event, 1, "go"), "confirmed")
+        self.s.save_results(999, event_ids[-1], {1:2,2:1}, [1,2], {1:1,2:2})
+        self.assertEqual(self.s.user(1)["level"], "C")
+        self.assertEqual(self.s.rating_profile(1)["level"], "C")
+        self.assertEqual(Store(self.path, lambda: self.now).user(1)["level"], "C")
+        restricted = self.s.save_event(999, dict(self.data, levels=["C+"]))
+        self.s.publish(999, restricted)
+        with self.assertRaises(RuleError):
+            self.s.join(restricted, 1, "go")
+
+    def test_rating_rule_visibility_and_enforced_admin_access(self):
+        def buttons():
+            return [b for row in self.api.calls[-1][1]["reply_markup"]["inline_keyboard"] for b in row]
+        self.app.menu(1)
+        self.assertIn("Мой Рейтинг 🏆", [b["text"] for b in buttons()])
+        self.assertNotIn("rating_rules", [b["callback_data"] for b in buttons()])
+        self.app.menu(999)
+        self.assertIn("rating_rules", [b["callback_data"] for b in buttons()])
+        self.app.ranking(-123)
+        self.assertNotIn("rating_rules", [b["callback_data"] for b in buttons()])
+        self.app.ranking(1)
+        self.assertNotIn("rating_rules", [b["callback_data"] for b in buttons()])
+        self.app.ranking(999)
+        self.assertIn("rating_rules", [b["callback_data"] for b in buttons()])
+        for chat, kind in ((1,"private"),(-123,"supergroup")):
+            with self.assertRaises(RuleError):
+                self.app.callback({"id":"q", "from":{"id":1}, "data":"rating_rules",
+                                   "message":{"chat":{"id":chat,"type":kind}}})
+        with self.assertRaises(RuleError):
+            self.app.rating_rules(1)
+        self.app.callback({"id":"q", "from":{"id":999}, "data":"rating_rules",
+                           "message":{"chat":{"id":-123,"type":"supergroup"}}})
+        self.assertEqual(self.api.calls[-1][1]["chat_id"], 999)
+        self.assertIn("Как считается", self.api.calls[-1][1]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
