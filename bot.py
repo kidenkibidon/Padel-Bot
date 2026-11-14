@@ -269,9 +269,8 @@ class App:
         self.send(uid, f"Турниры · {page+1}/{pages}" if events else "В этом разделе пока нет турниров.", kb(rows))
 
     def start_registration(self, uid, pending=None):
-        self.s.session(uid, {"kind": "register", "step": "name", "pending": pending})
-        self.send(uid, "Добро пожаловать в PADEL ESCAPE!\nКак вас зовут полностью? Это необязательно.",
-                  kb([[("Пропустить", "skip_name")]]))
+        self.s.session(uid, {"kind": "register", "step": "level", "pending": pending})
+        self.level_prompt(uid)
 
     def level_prompt(self, uid):
         self.send(uid, "Выберите уровень игры. После регистрации менять его сможет только администрация.",
