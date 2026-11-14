@@ -11,12 +11,12 @@ from contextlib import contextmanager
 
 
 LEVEL_START_RATINGS = {"D": 1.50, "D+": 2.25, "C": 2.75, "C+": 3.25,
-                       "B-": 4.50, "B": 4.00, "B+": 5.25, "A": 6.50}
+                       "B-": 4.00, "B": 4.50, "B+": 5.25, "A": 6.50}
 
 
 # Gaps keep the lower category until the next explicit threshold.
 LEVEL_THRESHOLDS = [(0.0, "D"), (2.0, "D+"), (2.5, "C"), (3.0, "C+"),
-                    (4.0, "B"), (4.5, "B-"), (5.0, "B+"), (6.0, "A")]
+                    (4.0, "B-"), (4.5, "B"), (5.0, "B+"), (6.0, "A")]
 
 
 def level_for_rating(value):
@@ -33,7 +33,10 @@ class RuleError(Exception):
     pass
 
 
-class Store:
+from scheduling import NotificationRules, daytime
+
+
+class Store(NotificationRules):
     def __init__(self, path, clock=time.time, turso_url=None, turso_token=None):
         self.path, self.clock = str(path), clock
         self.turso_url, self.turso_token = turso_url, turso_token
@@ -42,6 +45,15 @@ class Store:
         with self.db() as c:
             c.executescript("""
             PRAGMA journal_mode=WAL;
+            CREATE TABLE IF NOT EXISTS activity(user_id INTEGER PRIMARY KEY,bot_at REAL,group_at REAL);
+            CREATE TABLE IF NOT EXISTS vacancy_chains(event_id INTEGER PRIMARY KEY REFERENCES events(id),
+              generation INTEGER NOT NULL,active INTEGER NOT NULL,next_due REAL NOT NULL,
+              sent_count INTEGER NOT NULL DEFAULT 0,last_uid INTEGER);
+            CREATE TABLE IF NOT EXISTS vacancy_notices(id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_id INTEGER NOT NULL REFERENCES events(id),generation INTEGER NOT NULL,user_id INTEGER NOT NULL,
+              state TEXT NOT NULL,message_id INTEGER,rendered TEXT NOT NULL DEFAULT '',
+              attempts INTEGER NOT NULL DEFAULT 0,retry_at REAL NOT NULL DEFAULT 0,
+              UNIQUE(event_id,generation,user_id));
             CREATE TABLE IF NOT EXISTS courts(
               id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
               location TEXT NOT NULL, photo TEXT, updated_at REAL NOT NULL);
@@ -88,14 +100,30 @@ class Store:
                 c.execute("ALTER TABLE users ADD COLUMN rating_seed REAL")
             for level, value in LEVEL_START_RATINGS.items():
                 c.execute("UPDATE users SET rating_seed=? WHERE level=? AND rating_seed IS NULL", (value, level))
-        if self.get_setting("rating_algorithm") != "community-v3-b-seeds":
+        with self.db() as c:
+            columns = {r[1] for r in c.execute("PRAGMA table_info(courts)")}
+            if "active" not in columns:
+                c.execute("ALTER TABLE courts ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+            if "photo_meta" not in columns:
+                c.execute("ALTER TABLE courts ADD COLUMN photo_meta TEXT")
+        if self.get_setting("queue_algorithm") != "vacancy-v1":
             with self.db() as c:
-                # Correct the previous shared B/B- baseline once, then replay history.
-                for level in ("B", "B-"):
-                    c.execute("UPDATE users SET rating_seed=? WHERE level=? AND rating_seed=4.25",
-                              (LEVEL_START_RATINGS[level], level))
+                c.execute("UPDATE events SET dirty=1 WHERE id IN (SELECT event_id FROM entries WHERE status='offered')")
+                c.execute("UPDATE entries SET status='ready',ready_at=COALESCE(ready_at,joined_at),offer_until=NULL WHERE status='offered'")
+                c.execute("UPDATE outbox SET state='cancelled' WHERE kind IN ('offer','reminder') AND state='pending'")
+                c.execute("DELETE FROM settings WHERE key='offer_minutes'")
+                c.execute("INSERT OR REPLACE INTO settings VALUES('queue_algorithm',?)", (json.dumps('vacancy-v1'),))
+        previous_algorithm = self.get_setting('rating_algorithm')
+        if previous_algorithm != 'community-v4-b-order':
+            with self.db() as c:
+                if previous_algorithm == 'community-v3-b-seeds':
+                    # Swap original seeds once, regardless of later admin letter edits.
+                    c.execute("UPDATE users SET rating_seed=CASE rating_seed WHEN 4.0 THEN 4.5 WHEN 4.5 THEN 4.0 ELSE rating_seed END WHERE rating_seed IN (4.0,4.5)")
+                for level in ('B','B-'):
+                    c.execute("UPDATE users SET rating_seed=? WHERE level=? AND rating_seed=4.25", (LEVEL_START_RATINGS[level],level))
                 self._rebuild_ratings(c)
-                c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v3-b-seeds"),))
+                c.execute("UPDATE events SET dirty=1 WHERE status NOT IN ('draft','trash')")
+                c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps('community-v4-b-order'),))
 
     @contextmanager
     def db(self):
@@ -248,17 +276,18 @@ class Store:
                 old = self._event(c, eid)
                 if old["status"] in ("cancelled", "completed", "trash"):
                     raise RuleError("Завершённый или отменённый турнир не редактируется. Создайте копию.")
-                occupied = c.execute("SELECT count(*) FROM entries WHERE event_id=? AND status IN ('confirmed','offered')", (eid,)).fetchone()[0]
+                occupied = c.execute("SELECT count(*) FROM entries WHERE event_id=? AND status='confirmed'", (eid,)).fetchone()[0]
                 if old["status"] != "draft":
                     self.validate(data)
                 if (data.get("capacity") or 0) < occupied:
-                    raise RuleError("Новый лимит меньше числа занятых и зарезервированных мест.")
+                    raise RuleError("Новый лимит меньше числа занятых мест.")
                 if old["currency"] != (data.get("currency") or "") and c.execute(
                     "SELECT 1 FROM entries WHERE event_id=? AND paid=1 LIMIT 1", (eid,)
                 ).fetchone():
                     raise RuleError("Нельзя менять валюту при сохранённых оплатах. Создайте новый турнир.")
                 c.execute("UPDATE events SET data=?,revision=revision+1,dirty=1 WHERE id=?", (json.dumps(data), eid))
                 c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND kind='reminder' AND state='pending'", (eid,))
+                c.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (f"reminder_revision_at:{eid}", json.dumps(self.clock())))
                 if old["status"] != "draft":
                     for r in c.execute("SELECT user_id FROM entries WHERE event_id=? AND status IN ('confirmed','ready','unsure','offered')", (eid,)).fetchall():
                         self.enqueue(c, f"change:{eid}:{old['revision']+1}:{r[0]}", r[0],
@@ -300,6 +329,8 @@ class Store:
                 raise RuleError("Нельзя удалить турнир с записями игроков.")
             if delete:
                 c.execute("DELETE FROM outbox WHERE event_id=?", (eid,))
+                c.execute("DELETE FROM vacancy_notices WHERE event_id=?", (eid,))
+                c.execute("DELETE FROM vacancy_chains WHERE event_id=?", (eid,))
                 c.execute("DELETE FROM events WHERE id=?", (eid,))
             else:
                 c.execute("UPDATE events SET status=? WHERE id=?", ("draft" if restore else "trash", eid))
@@ -339,6 +370,7 @@ class Store:
             c.executemany("INSERT INTO event_results(event_id,user_id,place) VALUES(?,?,?)",
                           [(eid, uid, place) for uid,place in places.items()])
             c.execute("UPDATE events SET status='completed',dirty=1 WHERE id=?", (eid,))
+            self._fill(c, eid)
             c.execute("UPDATE entries SET status='ready',offer_until=NULL WHERE event_id=? AND status='offered'", (eid,))
             c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND kind IN ('offer','reminder','results_request') AND state='pending'", (eid,))
             self._rebuild_ratings(c)
@@ -500,6 +532,7 @@ class Store:
             if status == "cancelled":
                 for r in c.execute("SELECT user_id FROM entries WHERE event_id=? AND status!='declined'", (eid,)).fetchall():
                     self.enqueue(c, f"cancel:{eid}:{r[0]}", r[0], f"Турнир №{eid} «{e['court']}» отменён.", "cancel", eid)
+            self._fill(c, eid)
             self.audit(c, actor, "status", [eid, status])
 
     def entries(self, eid):
@@ -523,40 +556,6 @@ class Store:
           VALUES(?,?,?,?,?,?,?,?,?)""", (key, uid, text, json.dumps(keyboard) if keyboard else None,
                                         eid, revision, kind, self.clock() if due is None else due, expires))
 
-    def _fill(self, c, eid):
-        e = self._event(c, eid)
-        now = self.clock()
-        if e["status"] != "published" or now >= min(e["close_at"], e["start"]):
-            return
-        occupied = c.execute("SELECT count(*) FROM entries WHERE event_id=? AND status IN ('confirmed','offered')", (eid,)).fetchone()[0]
-        setting = c.execute("SELECT value FROM settings WHERE key='offer_minutes'").fetchone()
-        minutes = json.loads(setting[0]) if setting else 30
-        while occupied < e["capacity"]:
-            r = c.execute("SELECT * FROM entries WHERE event_id=? AND status='ready' ORDER BY ready_at,user_id LIMIT 1", (eid,)).fetchone()
-            if not r:
-                break
-            deadline = min(now + minutes * 60, e["close_at"], e["start"])
-            version = r["offer_version"] + 1
-            c.execute("UPDATE entries SET status='offered',offer_until=?,offer_version=? WHERE event_id=? AND user_id=?",
-                      (deadline, version, eid, r["user_id"]))
-            keyboard = {"inline_keyboard": [[
-                {"text": "Подтвердить место", "callback_data": f"accept:{eid}:{version}"},
-                {"text": "Отказаться", "callback_data": f"reject:{eid}:{version}"}]]}
-            self.enqueue(c, f"offer:{eid}:{r['user_id']}:{version}", r["user_id"],
-                         f"Для вас есть место в турнире №{eid} «{e['court']}»! Подтвердите до истечения предложения (не более {minutes} мин).",
-                         "offer", eid, keyboard=keyboard, expires=deadline)
-            occupied += 1
-            c.execute("UPDATE events SET dirty=1 WHERE id=?", (eid,))
-
-    def _expire(self, c, eid):
-        rows = c.execute("SELECT user_id FROM entries WHERE event_id=? AND status='offered' AND offer_until<=?", (eid, self.clock())).fetchall()
-        for r in rows:
-            c.execute("UPDATE entries SET status='unsure',offer_until=NULL,ready_at=NULL WHERE event_id=? AND user_id=?", (eid, r[0]))
-            self.enqueue(c, f"expired:{eid}:{r[0]}:{self.clock()}", r[0],
-                         f"Предложение места в турнире №{eid} истекло. Вы отмечены как «Пока не уверен». Для новой заявки нажмите «Иду».", "info", eid)
-        if rows:
-            c.execute("UPDATE events SET dirty=1 WHERE id=?", (eid,))
-
     def join(self, eid, uid, choice, force=False, actor=None, protect_confirmed=False):
         if choice not in ("go", "queue", "no"):
             raise RuleError("Неизвестный вариант.")
@@ -573,23 +572,17 @@ class Store:
                     raise RuleError("Запись закрыта.")
                 if e.get("levels") and self._effective_level(c, uid, u["level"]) not in e["levels"] and not force:
                     raise RuleError("Ваш уровень не подходит для этого турнира. Обратитесь к администратору.")
-            self._expire(c, eid)
             self._fill(c, eid)
             old = c.execute("SELECT * FROM entries WHERE event_id=? AND user_id=?", (eid, uid)).fetchone()
             if protect_confirmed and old and old["status"] == "confirmed" and choice in ("no", "queue"):
                 raise RuleError("У вас подтверждённое место. Нажмите кнопку ещё раз: бот предложит подтверждение в личном чате.")
-            occupied = c.execute("SELECT count(*) FROM entries WHERE event_id=? AND status IN ('confirmed','offered') AND user_id!=?", (eid, uid)).fetchone()[0]
+            occupied = c.execute("SELECT count(*) FROM entries WHERE event_id=? AND status='confirmed' AND user_id!=?", (eid, uid)).fetchone()[0]
             if choice == "no":
                 status = "declined"
             elif choice == "queue":
                 status = "unsure"
             elif old and old["status"] == "confirmed":
                 return "confirmed"
-            elif old and old["status"] == "offered" and force:
-                status = "confirmed"
-            elif old and old["status"] == "offered":
-                # An active offer is itself consent-required. The UI routes this to accept.
-                raise RuleError("У вас есть предложение места. Подтвердите его кнопкой в личном сообщении.")
             else:
                 status = "confirmed" if occupied < e["capacity"] else "ready"
             ready_at = old["ready_at"] if old and old["status"] == "ready" and status == "ready" else (now if status == "ready" else None)
@@ -600,24 +593,15 @@ class Store:
             if old and old["status"] == "offered":
                 c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND user_id=? AND kind='offer' AND state='pending'", (eid, uid))
             c.execute("UPDATE events SET dirty=1 WHERE id=?", (eid,))
+            if status != "ready":
+                self._queue_departure(c, eid, uid)
             self._fill(c, eid)
             if actor:
                 self.audit(c, actor, "move", [eid, uid, status])
             return status
 
     def answer_offer(self, eid, uid, version, accept):
-        with self.db() as c:
-            e = self._event(c, eid)
-            r = c.execute("SELECT * FROM entries WHERE event_id=? AND user_id=?", (eid, uid)).fetchone()
-            if not r or r["status"] != "offered" or r["offer_version"] != version or r["offer_until"] <= self.clock():
-                raise RuleError("Это предложение уже недействительно.")
-            if e["status"] != "published" or self.clock() >= e["close_at"]:
-                raise RuleError("Запись закрыта.")
-            c.execute("UPDATE entries SET status=?,joined_at=?,ready_at=NULL,offer_until=NULL WHERE event_id=? AND user_id=?",
-                      ("confirmed" if accept else "declined", self.clock(), eid, uid))
-            c.execute("UPDATE events SET dirty=1 WHERE id=?", (eid,))
-            c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND user_id=? AND kind='offer' AND state='pending'", (eid, uid))
-            self._fill(c, eid)
+        raise RuleError("Резервирование отменено. Откройте турнир и нажмите «Иду»; место доступно первому подтвердившему.")
 
     def paid(self, actor, eid, uid, value):
         with self.db() as c:
@@ -633,7 +617,6 @@ class Store:
             now = self.clock()
             for er in c.execute("SELECT id FROM events WHERE status IN ('published','closed')").fetchall():
                 eid = er[0]
-                self._expire(c, eid)
                 e = self._event(c, eid)
                 if e["status"] == "published" and now >= e["close_at"]:
                     c.execute("UPDATE events SET status='closed',dirty=1 WHERE id=?", (eid,))
@@ -645,19 +628,15 @@ class Store:
                     self.request_results(c, eid)
                     continue
                 for en in c.execute("SELECT * FROM entries WHERE event_id=? AND status='confirmed'", (eid,)).fetchall():
-                    for hours in (24, 12, 2, 1):
-                        due = e["start"] - hours * 3600
-                        if due <= en["joined_at"]:
-                            continue
-                        self.enqueue(c, f"reminder:{eid}:{e['revision']}:{en['user_id']}:{hours}:{en['joined_at']}",
-                                     en["user_id"], f"Напоминание: турнир №{eid} «{e['court']}» через {hours} ч. Проверьте карточку и локацию в разделе «Турниры».",
-                                     "reminder", eid, e["revision"], due=due, expires=min(due + 900, e["start"]))
+                    self._enqueue_reminders(c, e, en)
 
     def due_notifications(self):
         with self.db() as c:
             return [dict(r) for r in c.execute("SELECT * FROM outbox WHERE state='pending' AND due<=? ORDER BY due,id LIMIT 20", (self.clock(),))]
 
     def notification_valid(self, n):
+        if n["kind"] == "reminder" and not daytime(self.clock()):
+            return False
         if n["expires"] and n["expires"] <= self.clock():
             return False
         if n["kind"] == "personal_result":
@@ -697,27 +676,39 @@ class Store:
             self.audit(c, actor, "broadcast", [target, len(users)])
             return len(users)
 
-    def save_court(self, actor, data):
+    def save_court(self, actor, data, cid=None):
         name = str(data.get("court") or "").strip()
         location = str(data.get("location") or "")
         if not name or len(name) > 120 or not location.startswith("https://") or len(location) > 250:
             raise RuleError("Для шаблона заполните название корта и https-ссылку на карту.")
         with self.db() as c:
-            cid = c.execute("INSERT INTO courts(name,location,photo,updated_at) VALUES(?,?,?,?)",
-                            (name, location, data.get("photo"), self.clock())).lastrowid
+            values = (name, location, data.get("photo"), self.clock(), json.dumps(data.get("photo_meta")))
+            if cid is None:
+                cid = c.execute("INSERT INTO courts(name,location,photo,updated_at,photo_meta) VALUES(?,?,?,?,?)", values).lastrowid
+            else:
+                if not c.execute("SELECT 1 FROM courts WHERE id=?", (cid,)).fetchone():
+                    raise RuleError("Корт не найден.")
+                c.execute("UPDATE courts SET name=?,location=?,photo=?,updated_at=?,photo_meta=? WHERE id=?", values+(cid,))
             self.audit(c, actor, "save_court", cid)
             return cid
 
-    def courts(self):
+    def courts(self, include_archived=False):
         with self.db() as c:
-            return [dict(r) for r in c.execute("SELECT * FROM courts ORDER BY name,id")]
+            return [dict(r) for r in c.execute("SELECT * FROM courts " + ("" if include_archived else "WHERE active=1 ") + "ORDER BY name,id")]
 
     def court_data(self, cid):
         with self.db() as c:
             r = c.execute("SELECT * FROM courts WHERE id=?", (cid,)).fetchone()
-            if not r:
-                raise RuleError("Шаблон корта не найден.")
-            return dict(court=r["name"], location=r["location"], photo=r["photo"], court_template_id=cid)
+            if not r or not r["active"]:
+                raise RuleError("Шаблон корта не найден или в архиве.")
+            return dict(court=r["name"], location=r["location"], photo=r["photo"], photo_meta=json.loads(r["photo_meta"] or "null"), court_template_id=cid)
+
+    def archive_court(self, actor, cid, active=False):
+        with self.db() as c:
+            if not c.execute("SELECT 1 FROM courts WHERE id=?", (cid,)).fetchone():
+                raise RuleError("Корт не найден.")
+            c.execute("UPDATE courts SET active=? WHERE id=?", (int(active), cid))
+            self.audit(c, actor, "archive_court", [cid, active])
 
     def backup(self, target):
         if not self.turso_url:
