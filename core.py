@@ -2,6 +2,8 @@
 import json
 import sqlite3
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 
 
@@ -112,7 +114,13 @@ class Store:
         r = c.execute("SELECT * FROM events WHERE id=?", (eid,)).fetchone()
         if not r:
             raise RuleError("Турнир не найден.")
-        return {**dict(r), **json.loads(r["data"])}
+        data = json.loads(r["data"])
+        defaults = dict(photo=None, court="", format="", start=0, close_at=0,
+                        duration=0, capacity=0, location="", price=0, currency="", included="", levels=[])
+        defaults.update({k: v for k, v in data.items() if v is not None})
+        if not defaults["close_at"]:
+            defaults["close_at"] = defaults["start"]
+        return {**dict(r), **defaults}
 
     def event(self, eid):
         with self.db() as c:
@@ -121,62 +129,104 @@ class Store:
     def events(self):
         with self.db() as c:
             ids = [r[0] for r in c.execute("SELECT id FROM events")]
-            return sorted([self._event(c, i) for i in ids], key=lambda e: e["start"])
+            return sorted([self._event(c, i) for i in ids], key=lambda e: e.get("start") or 0)
 
     def validate(self, data):
+        labels = {"court": "Название корта", "format": "Формат", "start": "Дата и время",
+                  "duration": "Продолжительность", "capacity": "Количество игроков"}
+        missing = [label for key, label in labels.items() if not data.get(key)]
+        if missing:
+            raise RuleError("Перед публикацией заполните: " + ", ".join(missing))
         for k in ("court", "format", "included"):
-            if not isinstance(data.get(k), str) or not 1 <= len(data[k]) <= (120 if k != "included" else 250):
+            if data.get(k) and (not isinstance(data[k], str) or len(data[k]) > (250 if k == "included" else 120)):
                 raise RuleError("Некорректное поле: " + k)
-        if data.get("capacity") not in (4, 8, 12, 16, 20, 24):
+        if data["capacity"] not in (4, 8, 12, 16, 20, 24):
             raise RuleError("Вместимость: 4, 8, 12, 16, 20 или 24.")
-        if not 15 <= data.get("duration", 0) <= 1440:
+        if not 15 <= data["duration"] <= 1440:
             raise RuleError("Продолжительность: от 15 до 1440 минут.")
-        if not 0 <= data.get("price", -1) <= 100000000:
+        price = data.get("price")
+        if price is not None and not 0 <= price <= 100000000:
             raise RuleError("Некорректная стоимость.")
-        if len(data.get("currency", "")) != 3 or not data["currency"].isascii() or not data["currency"].isalpha():
-            raise RuleError("Валюта: три латинские буквы, например AED.")
-        if not data.get("location", "").startswith("https://") or len(data["location"]) > 250:
+        currency = data.get("currency") or ""
+        if price is not None and (len(currency) != 3 or not currency.isascii() or not currency.isalpha()):
+            raise RuleError("Укажите валюту стоимости, например AED.")
+        location = data.get("location")
+        if location and (not location.startswith("https://") or len(location) > 250):
             raise RuleError("Нужна https-ссылка на карту или Telegram-локация.")
-        if data.get("close_at", 0) > data.get("start", 0):
+        if (data.get("close_at") or data["start"]) > data["start"]:
             raise RuleError("Запись должна закрываться не позже начала.")
 
     def save_event(self, actor, data, eid=None):
-        self.validate(data)
         with self.db() as c:
             if eid is None:
                 eid = c.execute("INSERT INTO events(data) VALUES(?)", (json.dumps(data),)).lastrowid
             else:
                 old = self._event(c, eid)
-                if old["status"] in ("cancelled", "completed"):
+                if old["status"] in ("cancelled", "completed", "trash"):
                     raise RuleError("Завершённый или отменённый турнир не редактируется. Создайте копию.")
                 occupied = c.execute("SELECT count(*) FROM entries WHERE event_id=? AND status IN ('confirmed','offered')", (eid,)).fetchone()[0]
-                if data["capacity"] < occupied:
+                if old["status"] != "draft":
+                    self.validate(data)
+                if (data.get("capacity") or 0) < occupied:
                     raise RuleError("Новый лимит меньше числа занятых и зарезервированных мест.")
-                if old["currency"] != data["currency"] and c.execute(
+                if old["currency"] != (data.get("currency") or "") and c.execute(
                     "SELECT 1 FROM entries WHERE event_id=? AND paid=1 LIMIT 1", (eid,)
                 ).fetchone():
                     raise RuleError("Нельзя менять валюту при сохранённых оплатах. Создайте новый турнир.")
-                if old["status"] != "draft" and not data.get("photo"):
-                    raise RuleError("Для опубликованного турнира нужна фотография.")
                 c.execute("UPDATE events SET data=?,revision=revision+1,dirty=1 WHERE id=?", (json.dumps(data), eid))
                 c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND kind='reminder' AND state='pending'", (eid,))
                 if old["status"] != "draft":
                     for r in c.execute("SELECT user_id FROM entries WHERE event_id=? AND status IN ('confirmed','ready','unsure','offered')", (eid,)).fetchall():
                         self.enqueue(c, f"change:{eid}:{old['revision']+1}:{r[0]}", r[0],
-                                     f"Данные турнира №{eid} изменены. Проверьте актуальную карточку в разделе «Турниры».",
+                                     self.change_text(eid, old, self._event(c, eid)),
                                      "change", eid)
                 # An increased capacity may create offers for the existing ready queue.
                 self._fill(c, eid)
             self.audit(c, actor, "save_event", eid)
             return eid
 
+    @staticmethod
+    def change_text(eid, old, new):
+        labels = {"start": "Дата и время", "court": "Корт", "location": "Локация",
+                  "duration": "Длительность", "capacity": "Мест", "price": "Стоимость",
+                  "currency": "Валюта", "included": "Включено", "levels": "Уровни",
+                  "format": "Формат", "close_at": "Закрытие записи"}
+        lines = [f"Турнир №{eid}: изменения"]
+        def display(key, value):
+            if key in ("start", "close_at") and value:
+                return datetime.fromtimestamp(value, ZoneInfo("Asia/Dubai")).strftime("%d.%m.%Y %H:%M")
+            if key == "price":
+                return f"{(value or 0)/100:.2f}"
+            if isinstance(value, list):
+                return ", ".join(value) or "Все уровни"
+            return str(value) if value not in (None, "") else "Не указано"
+        for key, label in labels.items():
+            if old.get(key) != new.get(key):
+                lines.append(f"{label}: {display(key, old.get(key))} → {display(key, new.get(key))}")
+        lines.append("Актуальная карточка — в разделе «Турниры».")
+        return "\n".join(lines)
+
+    def trash_draft(self, actor, eid, restore=False, delete=False):
+        with self.db() as c:
+            e = self._event(c, eid)
+            expected = "trash" if restore or delete else "draft"
+            if e["status"] != expected:
+                raise RuleError("Действие доступно только для черновика в соответствующем разделе.")
+            if c.execute("SELECT 1 FROM entries WHERE event_id=?", (eid,)).fetchone():
+                raise RuleError("Нельзя удалить турнир с записями игроков.")
+            if delete:
+                c.execute("DELETE FROM outbox WHERE event_id=?", (eid,))
+                c.execute("DELETE FROM events WHERE id=?", (eid,))
+            else:
+                c.execute("UPDATE events SET status=? WHERE id=?", ("draft" if restore else "trash", eid))
+            self.audit(c, actor, "delete" if delete else "restore" if restore else "trash", eid)
+
     def publish(self, actor, eid):
         with self.db() as c:
             e = self._event(c, eid)
             if e["status"] != "draft":
                 raise RuleError("Турнир уже опубликован.")
-            if not e.get("photo"):
-                raise RuleError("Перед публикацией загрузите фото корта.")
+            self.validate(json.loads(e["data"]))
             if e["start"] <= self.clock() or e["close_at"] <= self.clock():
                 raise RuleError("Укажите будущие даты турнира и закрытия записи.")
             c.execute("UPDATE events SET status='published',dirty=1 WHERE id=?", (eid,))
@@ -260,7 +310,7 @@ class Store:
             u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             if not u or not u["level"] or not u["private_started"]:
                 raise RuleError("Сначала пройдите регистрацию в личном чате.")
-            if e["status"] in ("draft", "cancelled", "completed"):
+            if e["status"] in ("draft", "trash", "cancelled", "completed"):
                 raise RuleError("Запись на этот турнир недоступна.")
             if choice != "no":
                 if (e["status"] != "published" or now >= min(e["start"], e["close_at"])) and not force:
@@ -354,7 +404,7 @@ class Store:
         if n["event_id"] and n["kind"] in ("offer", "reminder"):
             e = self.event(n["event_id"])
             en = self.entry(n["event_id"], n["user_id"])
-            if e["status"] in ("draft", "cancelled", "completed") or not en:
+            if e["status"] in ("draft", "trash", "cancelled", "completed") or not en:
                 return False
             if n["kind"] == "offer":
                 return en["status"] == "offered" and en["offer_until"] > self.clock()
@@ -385,3 +435,4 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+

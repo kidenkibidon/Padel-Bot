@@ -21,11 +21,11 @@ from core import RuleError, Store
 
 LOG = logging.getLogger("padel")
 TZ = ZoneInfo("Asia/Dubai")
-DEFAULT_LEVELS = ["D", "D+", "C-", "C", "C+", "B-", "B", "B+", "A"]
+DEFAULT_LEVELS = ["D", "D+", "C-", "C", "C+", "B-", "B", "B+"]
 LABELS = {"confirmed": "Иду", "ready": "Жду место", "offered": "Предложено место",
           "unsure": "Пока не уверен", "declined": "Не иду"}
 STATUSES = {"draft": "Черновик", "published": "Запись открыта", "closed": "Запись закрыта",
-            "completed": "Завершён", "cancelled": "Отменён"}
+            "completed": "Завершён", "cancelled": "Отменён", "trash": "Корзина"}
 DAYS = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 FIELDS = [
     ("photo", "Пришлите одну фотографию корта. Для черновика можно отправить «-»."),
@@ -56,12 +56,9 @@ def kb(rows):
 
 
 def player(r):
-    uid = r.get("user_id", r.get("id"))
-    name = "@" + r["username"] if r.get("username") else r["display"]
-    text = f'<a href="tg://user?id={uid}">{esc(name)}</a>'
-    if r.get("full_name"):
-        text += " · " + esc(r["full_name"])
-    return text + " · " + esc(r.get("level") or "—")
+    # Public lists use plain profile names, without mentions or profile links.
+    name = (r.get("display") or "Игрок").replace("@", "＠")
+    return esc(name) + " · " + esc(r.get("level") or "—")
 
 
 class APIError(Exception):
@@ -127,27 +124,39 @@ class App:
         return self.send(uid, "🎾 <b>PADEL ESCAPE</b>\nВыберите действие:", kb(rows))
 
     def card_text(self, e):
-        start = datetime.fromtimestamp(e["start"], TZ)
-        end = start + timedelta(minutes=e["duration"])
+        raw = json.loads(e["data"])
         entries = self.s.entries(e["id"])
         n = sum(r["status"] == "confirmed" for r in entries)
         reserved = sum(r["status"] == "offered" for r in entries)
         waiting = sum(r["status"] in ("ready", "unsure", "offered") for r in entries)
         no = sum(r["status"] == "declined" for r in entries)
-        levels = ", ".join(e["levels"]) if e.get("levels") else "Все уровни"
-        close = datetime.fromtimestamp(e["close_at"], TZ).strftime("%d.%m %H:%M")
-        text = (f"<b>PADEL ESCAPE · {esc(e['format'])}</b> · №{e['id']}\n"
-                f"📅 {DAYS[start.weekday()]}, {start:%d.%m.%Y}\n"
-                f"🕒 {start:%H:%M}–{end:%H:%M} · {e['duration']} мин · Дубай\n"
-                f"📍 {esc(e['court'])}\n"
-                f'<a href="{esc(e["location"])}">🗺 Открыть карту</a>\n'
-                f"👥 {e['capacity']} игроков · {e['capacity']//4} корт(а/ов)\n"
-                f"Уровни: {esc(levels)}\n"
-                f"💰 {money(e['price'])} {esc(e['currency'])} с человека\n"
-                f"✅ Включено: {esc(e['included'])}\n"
-                f"Запись до {close} (Дубай)\n"
-                f"<b>{STATUSES[e['status']]}</b>\n"
-                f"Идут: {n}/{e['capacity']} · Резерв: {reserved}\nОчередь: {waiting} · Не идут: {no}")
+        lines = [f"<b>PADEL ESCAPE{(' · ' + esc(e['format'])) if e.get('format') else ''}</b> · №{e['id']}"]
+        if e.get("start"):
+            start = datetime.fromtimestamp(e["start"], TZ)
+            lines.append(f"📅 {DAYS[start.weekday()]}, {start:%d.%m.%Y}")
+            end = start + timedelta(minutes=e.get("duration") or 0)
+            lines.append(f"🕒 {start:%H:%M}" + (f"–{end:%H:%M} · {e['duration']} мин" if e.get("duration") else "") + " · Дубай")
+        elif e.get("duration"):
+            lines.append(f"Продолжительность: {e['duration']} мин")
+        if e.get("court"):
+            lines.append("📍 " + esc(e["court"]))
+        if e.get("location"):
+            lines.append(f'<a href="{esc(e["location"])}">🗺 Открыть карту</a>')
+        if e.get("capacity"):
+            lines.append(f"👥 {e['capacity']} игроков · {e['capacity']//4} корт(а/ов)")
+        if raw.get("levels"):
+            lines.append("Уровни: " + esc(", ".join(e["levels"])))
+        if raw.get("price") is not None:
+            lines.append(f"💰 {money(e['price'])} {esc(e.get('currency') or '')} с человека")
+        if e.get("included"):
+            lines.append("✅ Включено: " + esc(e["included"]))
+        if raw.get("close_at"):
+            close = datetime.fromtimestamp(e["close_at"], TZ).strftime("%d.%m %H:%M")
+            lines.append(f"Запись до {close} (Дубай)")
+        lines.append(f"<b>{STATUSES[e['status']]}</b>")
+        if e["status"] not in ("draft", "trash"):
+            lines.append(f"Идут: {n}/{e['capacity']} · Резерв: {reserved}\nОчередь: {waiting} · Не идут: {no}")
+        text = "\n".join(lines)
         # Keep public summaries within Telegram's message size. Full names remain in paginated lists.
         for title, states in (("Идут", ("confirmed",)), ("Очередь", ("offered", "ready", "unsure")), ("Не идут", ("declined",))):
             selected = [r for r in entries if r["status"] in states]
@@ -197,26 +206,30 @@ class App:
 
     def show_event(self, uid, eid):
         e = self.s.event(eid)
-        if e["status"] == "draft" and uid not in self.admins:
+        if e["status"] in ("draft", "trash") and uid not in self.admins:
             raise RuleError("Турнир ещё не опубликован.")
         if e.get("photo"):
             # A separate text message keeps full details and rosters out of photo caption limits.
             self.api.call("sendPhoto", chat_id=uid, photo=e["photo"])
-        return self.send(uid, self.card_text(e), self.event_keyboard(eid) if e["status"] != "draft" else None)
+        return self.send(uid, self.card_text(e), self.event_keyboard(eid) if e["status"] not in ("draft", "trash") else None)
 
     def refresh(self):
         for e in self.s.events():
-            if e["status"] == "draft" or not e["dirty"]:
+            if e["status"] in ("draft", "trash") or not e["dirty"]:
                 continue
             try:
                 group = self.group_id()
-                if not e["photo_msg"]:
+                if e.get("photo") and not e["photo_msg"]:
                     photo = self.api.call("sendPhoto", chat_id=group, photo=e["photo"])
                     with self.s.db() as c:
                         c.execute("UPDATE events SET photo_msg=? WHERE id=?", (photo["message_id"], e["id"]))
-                else:
+                elif e.get("photo") and e["photo_msg"]:
                     self.edit("editMessageMedia", chat_id=group, message_id=e["photo_msg"],
                               media={"type": "photo", "media": e["photo"]})
+                elif not e.get("photo") and e["photo_msg"]:
+                    self.api.call("deleteMessage", chat_id=group, message_id=e["photo_msg"])
+                    with self.s.db() as c:
+                        c.execute("UPDATE events SET photo_msg=NULL WHERE id=?", (e["id"],))
                 if not e["roster_msg"]:
                     r = self.send(group, self.card_text(e), self.event_keyboard(e["id"]))
                     with self.s.db() as c:
@@ -242,8 +255,11 @@ class App:
         now = self.s.clock()
         events = []
         for e in self.s.events():
-            if mode == "admin_events":
-                if e["status"] not in ("completed", "cancelled"):
+            if mode in ("admin_events", "drafts", "trash", "copy_events"):
+                if ((mode == "drafts" and e["status"] == "draft") or
+                    (mode == "trash" and e["status"] == "trash") or
+                    (mode == "copy_events" and e["status"] != "trash") or
+                    (mode == "admin_events" and e["status"] in ("published", "closed"))):
                     events.append(e)
                 continue
             if e["status"] not in ("published", "closed") or e["start"] + e["duration"]*60 <= now:
@@ -258,9 +274,9 @@ class App:
         page = min(max(page, 0), pages-1)
         rows = []
         for e in events[page*10:(page+1)*10]:
-            dt = datetime.fromtimestamp(e["start"], TZ)
-            prefix = "ae" if mode == "admin_events" else "event"
-            rows.append([(f"№{e['id']} · {dt:%d.%m %H:%M} · {e['court'][:30]}", f"{prefix}:{e['id']}")])
+            dt = datetime.fromtimestamp(e["start"], TZ).strftime("%d.%m %H:%M") if e.get("start") else "Без даты"
+            prefix = "copy" if mode == "copy_events" else "ae" if mode in ("admin_events", "drafts", "trash") else "event"
+            rows.append([(f"№{e['id']} · {dt} · {(e.get('court') or 'Без названия')[:30]}", f"{prefix}:{e['id']}")])
         nav = []
         if page:
             nav.append(("←", f"eventpage:{mode}:{page-1}"))
@@ -282,6 +298,8 @@ class App:
         self.admin(uid)
         self.send(uid, "<b>Административная панель</b>", kb([
             [("Создать турнир", "new"), ("Турниры", "admin_events")],
+            [("Черновики", "drafts"), ("Корзина", "trash")],
+            [("Копировать турнир", "copy_events")],
             [("Участники", "users:0"), ("Задачи", "tasks")],
             [("Рассылка", "broadcast"), ("Закреп регистрации", "registration_post")],
             [("Настройки", "settings")],
@@ -290,6 +308,13 @@ class App:
     def admin_event(self, uid, eid):
         self.admin(uid)
         e = self.s.event(eid)
+        if e["status"] in ("draft", "trash"):
+            rows = ([[("Продолжить", f"edit:{eid}"), ("Предпросмотр", f"preview:{eid}")],
+                     [("Опубликовать", f"publish:{eid}"), ("В корзину", f"trash_draft:{eid}")]]
+                    if e["status"] == "draft" else
+                    [[("Восстановить", f"restore_draft:{eid}"), ("Удалить навсегда", f"delete_draft:{eid}")]])
+            self.send(uid, self.card_text(e), kb(rows))
+            return
         entries = self.s.entries(eid)
         active = [r for r in entries if r["status"] == "confirmed"]
         paid = [r for r in active if r["paid"]]
@@ -355,21 +380,128 @@ class App:
                      [("В неуверенные", f"move:{eid}:{target}:queue"), ("Не идёт", f"move:{eid}:{target}:no")]]
         self.send(uid, text, kb(rows))
 
-    def wizard_prompt(self, uid, session):
+    def persist_wizard(self, uid, session):
+        # New drafts live in events; edits of published cards are staged in durable sessions.
+        eid = session.get("eid")
+        if eid is None or self.s.event(eid)["status"] == "draft":
+            session["eid"] = self.s.save_event(uid, session["data"], eid)
+            self.s.setting(f"draft_step:{session['eid']}", session["index"])
+        self.s.session(uid, session)
+
+    def pause_wizard(self, uid):
+        session = self.s.session(uid)
+        if session and session.get("kind") == "wizard":
+            eid = session.get("eid")
+            if eid and self.s.event(eid)["status"] != "draft":
+                session["eid"] = None
+            self.persist_wizard(uid, session)
+            self.send(uid, f"Черновик №{session['eid']} сохранён. Продолжить можно в разделе «Черновики».")
+        self.s.session(uid, clear=True)
+
+    def wizard_prompt(self, uid, session, preserve_token=False):
+        import secrets
         index = session["index"]
         if index >= len(FIELDS):
-            self.save_wizard(uid, session)
+            try:
+                self.save_wizard(uid, session)
+            except RuleError as exc:
+                session["index"] = len(FIELDS) - 1
+                self.send(uid, esc(str(exc)))
+                self.wizard_prompt(uid, session)
             return
         key, prompt = FIELDS[index]
+        prompt = prompt.replace(" Для черновика можно отправить «-».", "")
         if key == "levels":
-            prompt += "\nВарианты: " + ", ".join(self.levels)
-        if session.get("eid"):
-            value = session["data"].get(key)
-            prompt += "\nОтправьте «=», чтобы оставить текущее значение."
-            if key not in ("photo",):
-                prompt += "\nСейчас: " + esc(value)
+            prompt = "Отметьте допустимые уровни. Повторное нажатие снимает отметку. Затем нажмите «Готово»."
+        if key == "close_at":
+            prompt = "Окончание записи по Дубаю: ДД.ММ.ГГГГ ЧЧ:ММ. Пропуск — запись до начала игры."
+        token = session.get("token") if preserve_token else secrets.token_hex(4)
+        session["token"] = token
+        rows = []
+        if key == "levels":
+            selected = session["data"].get("levels") or []
+            rows = [[(("✅ " if level in selected else "") + level, f"wiz:{token}:level:{i}")]
+                    for i, level in enumerate(self.levels)]
+        elif key == "included":
+            selected = session.get("included_choices", [])
+            rows = [[(("✅ " if value in selected else "") + value, f"wiz:{token}:included:{i}")]
+                    for i, value in enumerate(("Вода", "Соки", "Мячи", "Аренда ракетки"))]
+        else:
+            options = {"format": ["Americano", "Mexicano", "Тренировка", "Матчи"],
+                       "duration": [60, 90, 120], "capacity": [4, 8, 12, 16, 20, 24],
+                       "price": [100, 150, 200], "currency": ["AED", "USD", "EUR"]}.get(key, [])
+            rows = [[(str(value), f"wiz:{token}:value:{i}")] for i, value in enumerate(options)]
+        if key in ("levels", "included") or key in session["data"]:
+            rows.append([("Готово", f"wiz:{token}:done")])
+        rows.append([("Пропустить", f"wiz:{token}:skip"), ("Назад", f"wiz:{token}:back")])
+        rows.append([("Сохранить и выйти", f"wiz:{token}:cancel")])
+        if session["data"].get(key) is not None and key != "photo":
+            value = session["data"][key]
+            if key in ("start", "close_at") and value:
+                value = datetime.fromtimestamp(value, TZ).strftime("%d.%m.%Y %H:%M")
+            prompt += "\nСохранено: " + esc(value)
+        self.persist_wizard(uid, session)
+        text = f"Шаг {index+1}/{len(FIELDS)}\n{prompt}\nМожно ввести свой вариант сообщением."
+        mid = session.get("prompt_mid")
+        if mid:
+            try:
+                self.edit("editMessageText", chat_id=uid, message_id=mid, text=text,
+                          parse_mode="HTML", reply_markup=kb(rows))
+                return
+            except APIError as exc:
+                if exc.code != 400:
+                    raise
+        result = self.send(uid, text, kb(rows))
+        session["prompt_mid"] = result["message_id"]
         self.s.session(uid, session)
-        self.send(uid, f"Шаг {index+1}/{len(FIELDS)}\n{prompt}\n/cancel — выйти, черновик не изменится.")
+
+    def wizard_callback(self, uid, parts):
+        self.admin(uid)
+        session = self.s.session(uid)
+        if not session or session.get("kind") != "wizard" or session.get("token") != parts[1]:
+            raise RuleError("Эта кнопка устарела. Используйте последнее сообщение мастера.")
+        key = FIELDS[session["index"]][0]
+        action = parts[2]
+        if action == "cancel":
+            self.pause_wizard(uid)
+            self.admin_menu(uid)
+            return
+        if action == "back":
+            session["index"] = max(0, session["index"] - 1)
+        elif action in ("level", "included"):
+            options = self.levels if action == "level" else ["Вода", "Соки", "Мячи", "Аренда ракетки"]
+            if key != ("levels" if action == "level" else "included"):
+                raise RuleError("Кнопка не относится к текущему шагу.")
+            value = options[int(parts[3])]
+            field = "levels" if action == "level" else "included_choices"
+            selected = list((session["data"] if action == "level" else session).get(field) or [])
+            selected.remove(value) if value in selected else selected.append(value)
+            if action == "level":
+                session["data"]["levels"] = [v for v in self.levels if v in selected]
+            else:
+                session[field] = selected
+                session["data"]["included"] = ", ".join(selected)
+        else:
+            if action == "skip":
+                session["data"].pop(key, None)
+                if key == "included":
+                    session.pop("included_choices", None)
+            elif action == "value":
+                options = {"format": ["Americano", "Mexicano", "Тренировка", "Матчи"],
+                           "duration": [60, 90, 120], "capacity": [4, 8, 12, 16, 20, 24],
+                           "price": [100, 150, 200], "currency": ["AED", "USD", "EUR"]}[key]
+                session["data"][key] = self.parse_field(key, {"text": str(options[int(parts[3])])}, session["data"])
+            elif action == "done":
+                if key == "levels":
+                    session["data"].setdefault("levels", [])
+                elif key == "included":
+                    session["data"].setdefault("included", "")
+                elif key not in session["data"]:
+                    raise RuleError("Сначала введите значение или нажмите «Пропустить».")
+            else:
+                raise RuleError("Неизвестная кнопка.")
+            session["index"] += 1
+        self.wizard_prompt(uid, session, preserve_token=action in ("level", "included"))
 
     def parse_field(self, key, message, data):
         text = message.get("text", "").strip()
@@ -383,14 +515,14 @@ class App:
             raise RuleError("Пришлите фото как изображение или «-».")
         if key in ("start", "close_at"):
             if key == "close_at" and text == "-":
-                return data["start"]
+                return data.get("start")
             try:
                 dt = datetime.strptime(text, "%d.%m.%Y %H:%M").replace(tzinfo=TZ)
             except ValueError:
                 raise RuleError("Формат даты: 20.11.2026 19:00") from None
             if dt.timestamp() <= self.s.clock():
                 raise RuleError("Укажите дату и время в будущем.")
-            if key == "close_at" and dt.timestamp() > data["start"]:
+            if key == "close_at" and data.get("start") and dt.timestamp() > data["start"]:
                 raise RuleError("Закрытие записи не позже начала игры.")
             return dt.timestamp()
         if key in ("duration", "capacity"):
@@ -433,14 +565,66 @@ class App:
         return text
 
     def save_wizard(self, uid, session):
+        self.s.session(uid, session)
         eid = self.s.save_event(uid, session["data"], session.get("eid"))
+        self.s.setting(f"draft_step:{eid}", 0)
         self.s.session(uid, clear=True)
         self.send(uid, f"Турнир №{eid} сохранён. Проверьте предпросмотр перед публикацией.")
         self.admin_event(uid, eid)
 
+    def registration_post(self, chat):
+        keyboard = {"inline_keyboard": [[{"text": "Выбрать рейтинг", "url": f"https://t.me/{self.username}?start=register"}]]}
+        key = f"registration_post:{chat}"
+        mid = self.s.get_setting(key)
+        text = "🎾 <b>PADEL ESCAPE</b>\nВыберите свой рейтинг один раз. Имя берётся из профиля Telegram.\nДалее изменить рейтинг сможет только администратор.\nНажмите кнопку и затем Start в личном чате бота."
+        if mid:
+            try:
+                self.edit("editMessageText", chat_id=chat, message_id=mid, text=text, parse_mode="HTML", reply_markup=keyboard)
+            except APIError as exc:
+                if exc.code != 400:
+                    raise
+                mid = None
+        if not mid:
+            m = self.send(chat, text, keyboard)
+            mid = m["message_id"]
+            self.s.setting(key, mid)
+        self.api.call("pinChatMessage", chat_id=chat, message_id=mid, disable_notification=True)
+
+    def welcome(self, chat, user, stamp):
+        bound = self.s.get_setting("group_id", self.group)
+        if not bound or int(bound) != chat or user.get("is_bot"):
+            return
+        key = f"welcome:{chat}:{user['id']}"
+        previous = self.s.get_setting(key)
+        if previous is not None and abs(stamp - previous) <= 5:
+            return
+        self.s.touch_user(user)
+        name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])) or "Игрок"
+        # Neutralize @ and phone-like profile names to avoid automatic Telegram links.
+        name = name.replace("@", "＠")
+        name = "".join(ch + "\u200b" if ch.isdigit() else ch for ch in name)
+        profile = self.s.user(user["id"])
+        keyboard = None
+        text = esc(name) + ", добро пожаловать! 🎾"
+        if not profile.get("level"):
+            text += "\nВыберите свой рейтинг один раз по кнопке ниже."
+            keyboard = {"inline_keyboard": [[{"text": "Выбрать рейтинг", "url": f"https://t.me/{self.username}?start=register"}]]}
+        self.send(chat, text, keyboard)
+        self.s.setting(key, stamp)
+
+    def member_update(self, member):
+        def active(value):
+            return value.get("status") in ("member", "administrator", "creator") or (value.get("status") == "restricted" and value.get("is_member", False))
+        if not active(member["old_chat_member"]) and active(member["new_chat_member"]):
+            self.welcome(member["chat"]["id"], member["new_chat_member"]["user"], member.get("date", self.s.clock()))
+
     def handle_message(self, m):
         uid, chat = m["from"]["id"], m["chat"]["id"]
         private = m["chat"]["type"] == "private"
+        if not private and m.get("new_chat_members"):
+            for user in m["new_chat_members"]:
+                self.welcome(chat, user, m.get("date", self.s.clock()))
+            return
         self.s.touch_user(m["from"], private)
         text = m.get("text", "").strip()
         cmd = text.split()[0].split("@")[0] if text else ""
@@ -454,18 +638,19 @@ class App:
                 old = self.s.get_setting("group_id", self.group)
                 if old and int(old) != chat:
                     with self.s.db() as c:
-                        exists = c.execute("SELECT 1 FROM events WHERE photo_msg IS NOT NULL LIMIT 1").fetchone()
+                        exists = c.execute("SELECT 1 FROM events WHERE photo_msg IS NOT NULL OR roster_msg IS NOT NULL LIMIT 1").fetchone()
                     if exists:
                         raise RuleError("Уже есть опубликованные карточки в другой группе. Перенос требует отдельной настройки.")
                 self.s.setting("group_id", chat)
-                self.send(chat, "Группа подключена. Создайте тестовый турнир в личной админке бота.")
+                self.send(chat, "Группа подключена.")
+                self.registration_post(chat)
             return
         if cmd == "/cancel":
-            self.s.session(uid, clear=True)
+            self.pause_wizard(uid)
             self.menu(uid)
             return
         if cmd == "/start":
-            self.s.session(uid, clear=True)
+            self.pause_wizard(uid)
             args = text.split(maxsplit=1)
             pending = None
             if len(args) == 2 and args[1].startswith("e"):
@@ -486,6 +671,7 @@ class App:
                         self.choice(uid, pending[1], pending[0])
             return
         if cmd == "/admin":
+            self.pause_wizard(uid)
             self.admin_menu(uid)
             return
         if cmd in ("/tournaments", "/my"):
@@ -500,14 +686,10 @@ class App:
             return
         kind = session["kind"]
         if kind == "register":
-            if session["step"] == "name":
-                if not 1 <= len(text) <= 100:
-                    raise RuleError("Введите имя до 100 символов или нажмите «Пропустить».")
-                session.update(step="level", name=text)
-                self.s.session(uid, session)
-                self.level_prompt(uid)
-            else:
-                self.level_prompt(uid)
+            session.update(step="level")
+            session.pop("name", None)
+            self.s.session(uid, session)
+            self.level_prompt(uid)
             return
         self.admin(uid)
         if kind == "wizard":
@@ -589,12 +771,14 @@ class App:
                           url=f"https://t.me/{self.username}?start={parameter or 'menu'}")
             return
         self.api.call("answerCallbackQuery", callback_query_id=q["id"])
-        if action == "menu":
+        if action == "wiz":
+            self.wizard_callback(uid, parts)
+        elif action == "menu":
             self.menu(uid)
         elif action in ("events", "mine", "waiting"):
             self.event_list(uid, action)
         elif action == "eventpage":
-            if parts[1] == "admin_events":
+            if parts[1] in ("admin_events", "drafts", "trash", "copy_events"):
                 self.admin(uid)
             elif parts[1] not in ("events", "mine", "waiting"):
                 raise RuleError("Неизвестный раздел.")
@@ -652,17 +836,21 @@ class App:
         a = p[0]
         if a == "admin":
             self.admin_menu(uid)
-        elif a == "admin_events":
+        elif a in ("admin_events", "drafts", "trash", "copy_events"):
             self.event_list(uid, a)
         elif a == "new":
+            self.pause_wizard(uid)
             self.wizard_prompt(uid, {"kind": "wizard", "index": 0, "data": {}})
         elif a == "ae":
             self.admin_event(uid, int(p[1]))
         elif a == "preview":
             self.show_event(uid, int(p[1]))
         elif a == "edit":
+            self.pause_wizard(uid)
             e = self.s.event(int(p[1]))
-            self.wizard_prompt(uid, {"kind": "wizard", "index": 0, "eid": e["id"], "data": json.loads(e["data"])})
+            if e["status"] not in ("draft", "published", "closed"):
+                raise RuleError("Восстановите черновик или создайте копию турнира.")
+            self.wizard_prompt(uid, {"kind": "wizard", "index": min(11, self.s.get_setting(f"draft_step:{e['id']}", 0)) if e["status"] == "draft" else 0, "eid": e["id"], "data": json.loads(e["data"])})
         elif a == "publish":
             eid = int(p[1])
             group = self.group_id()
@@ -680,8 +868,28 @@ class App:
             self.s.change_status(uid, int(p[1]), status)
             self.admin_event(uid, int(p[1]))
         elif a == "copy":
-            self.s.session(uid, {"kind": "copy", "eid": int(p[1])})
-            self.send(uid, "Новая дата и время по Дубаю: ДД.ММ.ГГГГ ЧЧ:ММ\nСостав и оплаты не копируются.")
+            self.pause_wizard(uid)
+            source = self.s.event(int(p[1]))
+            if source["status"] == "trash":
+                raise RuleError("Сначала восстановите черновик из корзины.")
+            data = json.loads(source["data"])
+            data.pop("start", None)
+            data.pop("close_at", None)
+            eid = self.s.save_event(uid, data)
+            self.send(uid, "Копия сохранена. Укажите новую дату и время; записи, очередь и оплаты не копируются.")
+            self.wizard_prompt(uid, {"kind": "wizard", "index": 3, "eid": eid, "data": data})
+        elif a in ("trash_draft", "restore_draft", "delete_draft", "delete_yes"):
+            eid = int(p[1])
+            if a == "delete_draft":
+                self.send(uid, "Окончательно удалить черновик? Восстановить его будет нельзя.",
+                          kb([[("Удалить навсегда", f"delete_yes:{eid}"), ("Отмена", f"ae:{eid}")]]))
+                return
+            self.s.trash_draft(uid, eid, restore=a == "restore_draft", delete=a == "delete_yes")
+            session = self.s.session(uid)
+            if session and session.get("eid") == eid:
+                self.s.session(uid, clear=True)
+            self.send(uid, "Удалено навсегда." if a == "delete_yes" else "Восстановлено." if a == "restore_draft" else "Перемещено в корзину.")
+            self.event_list(uid, "drafts" if a == "restore_draft" else "trash")
         elif a == "participants":
             self.users_page(uid, int(p[2]), int(p[1]))
         elif a == "users":
@@ -716,9 +924,7 @@ class App:
             self.api.call("pinChatMessage", chat_id=self.group_id(), message_id=e["roster_msg"], disable_notification=True)
             self.send(uid, "Карточка закреплена.")
         elif a == "registration_post":
-            keyboard = {"inline_keyboard": [[{"text": "Регистрация игрока", "url": f"https://t.me/{self.username}?start=register"}]]}
-            m = self.send(self.group_id(), "🎾 <b>PADEL ESCAPE</b>\nПройдите регистрацию один раз: имя по желанию и уровень игры.\nЗатем сможете записываться на турниры и получать личные напоминания.\nНик/имя и уровень будут видны в списках игроков.", keyboard)
-            self.api.call("pinChatMessage", chat_id=self.group_id(), message_id=m["message_id"], disable_notification=True)
+            self.registration_post(self.group_id())
             self.send(uid, "Сообщение регистрации опубликовано и закреплено.")
         elif a in ("broadcast", "broadcast_event"):
             target = "all" if a == "broadcast" else p[1]
@@ -757,7 +963,9 @@ class App:
         q = update.get("callback_query")
         m = update.get("message")
         try:
-            if q:
+            if update.get("chat_member"):
+                self.member_update(update["chat_member"])
+            elif q:
                 uid = q["from"]["id"]
                 private = q.get("message", {}).get("chat", {}).get("type") == "private"
                 self.callback(q)
@@ -856,7 +1064,7 @@ def main():
     db_path = Path(os.environ.get("DB_PATH", "data/padel.sqlite3"))
     db_path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(db_path.parent, 0o700)
-    levels = [x.strip() for x in os.environ.get("LEVELS", ",".join(DEFAULT_LEVELS)).split(",") if x.strip()]
+    levels = list(DEFAULT_LEVELS)
     if not levels or len(levels) > 20 or len(set(levels)) != len(levels):
         raise SystemExit("LEVELS: от 1 до 20 уникальных уровней.")
     lock = open(str(db_path) + ".lock", "w")
@@ -899,7 +1107,7 @@ def main():
     while running:
         try:
             updates = api.call("getUpdates", offset=store.get_setting("offset", 0),
-                               timeout=10, allowed_updates=["message", "callback_query"])
+                               timeout=10, allowed_updates=["message", "callback_query", "chat_member"])
             for u in updates:
                 app.handle(u)
                 store.setting("offset", u["update_id"]+1)
@@ -931,3 +1139,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

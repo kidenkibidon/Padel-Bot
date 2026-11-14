@@ -215,10 +215,13 @@ class DomainTests(unittest.TestCase):
         self.s.join(self.eid, 1, "go")
         self.assertFalse(self.s.notification_valid(old))
 
-    def test_publish_requires_photo_and_future(self):
+    def test_publish_optional_photo_and_required_future(self):
         eid = self.s.save_event(999, dict(self.data, photo=None))
+        self.s.publish(999, eid)
+        self.assertEqual(self.s.event(eid)["status"], "published")
+        past = self.s.save_event(999, dict(self.data, start=self.now-1, close_at=self.now-2))
         with self.assertRaises(RuleError):
-            self.s.publish(999, eid)
+            self.s.publish(999, past)
         with self.assertRaises(RuleError):
             self.s.publish(999, self.eid)
 
@@ -246,7 +249,7 @@ class DomainTests(unittest.TestCase):
             self.app.handle({"callback_query": {"id": "q", "from": {"id": uid, "first_name": "Егор"},
                 "data": data, "message": {"message_id": 1, "chat": {"id": uid, "type": "private"}}}})
         msg(f"/start ego_{self.eid}")
-        click("skip_name")
+        self.assertEqual(self.s.session(uid)["step"], "level")
         click("level:3")
         self.assertEqual(self.s.user(uid)["level"], "C")
         self.assertEqual(self.s.entry(self.eid, uid)["status"], "confirmed")
@@ -319,8 +322,195 @@ class DomainTests(unittest.TestCase):
         self.assertLess(len(text), 3900)
         self.assertIn("Полный список", text)
         roster, _ = self.app.roster_text(self.eid)
-        self.assertIn("Полное имя" * 10, roster)
+        self.assertIn("Имя" * 20, roster)
+        self.assertNotIn("tg://", roster)
+        self.assertNotIn("@", roster)
+
+    def wiz(self, action, value=None, uid=999):
+        session = self.s.session(uid)
+        parts = ["wiz", session["token"], action]
+        if value is not None:
+            parts.append(str(value))
+        self.app.wizard_callback(uid, parts)
+
+    def test_exact_eight_levels(self):
+        self.assertEqual(self.app.levels, ["D", "D+", "C-", "C", "C+", "B-", "B", "B+"])
+
+    def test_all_steps_skip_to_incomplete_draft_and_publish_guard(self):
+        self.app.admin_callback(999, ["new"])
+        for _ in range(12):
+            self.wiz("skip")
+        self.assertIsNone(self.s.session(999))
+        event = self.s.events()[0]  # Undated draft sorts first.
+        self.assertEqual(event["status"], "draft")
+        self.assertEqual(json.loads(event["data"]), {})
+        text = self.app.card_text(event)
+        for unwanted in ("💰", "Включено", "Открыть карту", "1970", "*", "None"):
+            self.assertNotIn(unwanted, text)
+        with self.assertRaisesRegex(RuleError, "Дата и время"):
+            self.s.publish(999, event["id"])
+
+    def test_multiselect_toggle_and_stale_buttons(self):
+        self.app.wizard_prompt(999, {"kind": "wizard", "index": 10, "data": dict(self.data, levels=[])})
+        old = self.s.session(999)["token"]
+        self.wiz("level", 0)
+        self.assertEqual(self.s.session(999)["token"], old)
+        self.wiz("level", 2)
+        self.assertEqual(self.s.session(999)["data"]["levels"], ["D", "C-"])
+        self.wiz("level", 0)
+        self.wiz("done")
+        self.assertEqual(self.s.session(999)["index"], 11)
+        with self.assertRaises(RuleError):
+            self.app.wizard_callback(999, ["wiz", old, "level", "1"])
+        self.assertEqual(self.s.session(999)["data"]["levels"], ["C-"])
+        self.wiz("back")
+        self.assertEqual(self.s.session(999)["index"], 10)
+
+    def test_draft_autosave_restart_cancel_trash_restore_delete(self):
+        self.app.admin_callback(999, ["new"])
+        self.wiz("skip")
+        session = self.s.session(999)
+        session["data"]["court"] = "Saved court"
+        session["index"] = 2
+        self.app.wizard_prompt(999, session)
+        eid = self.s.session(999)["eid"]
+        restored = Store(self.path, lambda: self.now)
+        self.assertEqual(restored.event(eid)["court"], "Saved court")
+        self.assertEqual(restored.session(999)["index"], 2)
+        self.wiz("cancel")
+        self.assertIsNone(self.s.session(999))
+        self.s.trash_draft(999, eid)
+        self.assertEqual(self.s.event(eid)["status"], "trash")
+        with self.assertRaises(RuleError):
+            self.s.publish(999, eid)
+        self.s.trash_draft(999, eid, restore=True)
+        self.assertEqual(self.s.event(eid)["court"], "Saved court")
+        with self.assertRaises(RuleError):
+            self.s.trash_draft(999, eid, delete=True)
+        self.s.trash_draft(999, eid)
+        self.app.admin_callback(999, ["delete_draft", str(eid)])
+        self.assertEqual(self.s.event(eid)["status"], "trash")
+        self.app.admin_callback(999, ["delete_yes", str(eid)])
+        with self.assertRaises(RuleError):
+            self.s.event(eid)
+        with self.assertRaises(RuleError):
+            self.s.trash_draft(999, self.eid)
+
+    def test_copy_is_clean_draft_without_date_entries_or_payments(self):
+        self.s.join(self.eid, 1, "go")
+        self.s.paid(999, self.eid, 1, True)
+        self.app.admin_callback(999, ["copy", str(self.eid)])
+        session = self.s.session(999)
+        eid = session["eid"]
+        self.assertNotEqual(eid, self.eid)
+        self.assertEqual(self.s.event(eid)["status"], "draft")
+        self.assertEqual(self.s.entries(eid), [])
+        data = json.loads(self.s.event(eid)["data"])
+        self.assertNotIn("start", data)
+        self.assertNotIn("close_at", data)
+        self.assertEqual(data["court"], self.data["court"])
+        self.assertEqual(self.s.entry(self.eid, 1)["paid"], 1)
+
+    def test_publish_without_optional_fields_and_photo_refresh(self):
+        data = {k:v for k,v in self.data.items() if k not in ("photo", "included", "location", "price", "currency", "close_at", "levels")}
+        eid = self.s.save_event(999, data)
+        self.s.publish(999, eid)
+        self.app.refresh()
+        event = self.s.event(eid)
+        self.assertIsNotNone(event["roster_msg"])
+        self.assertIsNone(event["photo_msg"])
+        self.assertFalse(event["dirty"])
+        text = self.app.card_text(event)
+        for value in ("💰", "Включено", "Открыть карту", "Запись до", "Уровни:"):
+            self.assertNotIn(value, text)
+        self.s.join(eid, 1, "go")
+        self.s.tick()
+        self.assertEqual(self.s.entry(eid, 1)["status"], "confirmed")
+
+    def test_published_edit_autosave_does_not_change_live_until_saved(self):
+        self.s.join(self.eid, 1, "go")
+        self.app.admin_callback(999, ["edit", str(self.eid)])
+        session = self.s.session(999)
+        session["data"]["court"] = "New court"
+        self.app.wizard_prompt(999, session)
+        self.assertEqual(self.s.event(self.eid)["court"], self.data["court"])
+        self.assertFalse(any(n["kind"] == "change" for n in self.s.due_notifications()))
+        self.app.pause_wizard(999)
+        draft = [e for e in self.s.events() if e["status"] == "draft"][0]
+        self.assertEqual(draft["court"], "New court")
+        self.assertEqual(self.s.event(self.eid)["court"], self.data["court"])
+        self.assertEqual(self.s.entries(draft["id"]), [])
+
+    def test_notification_describes_date_court_and_location_changes(self):
+        self.s.join(self.eid, 1, "go")
+        self.s.save_event(999, dict(self.data, court="New court", location="https://example.com/map", start=self.data["start"]+3600), self.eid)
+        notices = [n for n in self.s.due_notifications() if n["kind"] == "change"]
+        self.assertEqual(len(notices), 1)
+        for part in ("Дата и время", "Корт", "Локация", "New court", "→"):
+            self.assertIn(part, notices[0]["text"])
+
+    def test_welcome_plain_name_dedupes_and_no_repeat_rating(self):
+        user = {"id": 100, "first_name": "<Iegor>", "username": "secret_name"}
+        self.app.welcome(-123, user, self.now)
+        self.app.welcome(-123, user, self.now)
+        self.assertEqual(len(self.api.calls), 1)
+        text = self.api.calls[0][1]["text"]
+        self.assertIn("&lt;Iegor&gt;, добро пожаловать", text)
+        self.assertNotIn("secret_name", text)
+        self.assertNotIn("tg://", text)
+        self.assertTrue(self.api.calls[0][1]["reply_markup"])
+        self.s.register(100, "", "C")
+        self.app.welcome(-123, user, self.now+100)
+        self.assertIsNone(self.api.calls[-1][1]["reply_markup"])
+        self.assertEqual(self.s.user(100)["level"], "C")
+        self.app.welcome(-999, user, self.now+200)
+        self.assertEqual(len(self.api.calls), 2)
+
+    def test_chat_member_and_service_join_welcome_only_once(self):
+        user = {"id": 100, "first_name": "Player"}
+        self.app.handle({"chat_member": {"chat": {"id": -123}, "date": self.now,
+            "old_chat_member": {"status": "left", "user": user},
+            "new_chat_member": {"status": "member", "user": user}}})
+        self.app.handle({"message": {"from": {"id": 999}, "chat": {"id": -123, "type": "supergroup"},
+            "new_chat_members": [user], "date": self.now}})
+        self.assertEqual(sum(m == "sendMessage" for m,p in self.api.calls), 1)
+
+    def test_bind_posts_registration_once_and_preserves_ratings(self):
+        message = {"from": {"id": 999}, "chat": {"id": -123, "type": "supergroup"}, "text": "/bind"}
+        self.app.handle_message(message)
+        self.app.handle_message(message)
+        posts = [p for m,p in self.api.calls if m == "sendMessage" and "Выберите свой рейтинг" in p["text"]]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(sum(m == "pinChatMessage" for m,p in self.api.calls), 2)
+        self.assertEqual(self.s.user(1)["level"], "C")
+
+    def test_included_buttons_and_presets(self):
+        self.app.wizard_prompt(999, {"kind": "wizard", "index": 9, "data": {}})
+        self.wiz("included", 0)
+        self.wiz("included", 2)
+        self.wiz("done")
+        self.assertEqual(self.s.session(999)["data"]["included"], "Вода, Мячи")
+        self.wiz("back")
+        self.wiz("skip")
+        self.assertNotIn("included", self.s.session(999)["data"])
+        self.app.pause_wizard(999)
+        self.app.wizard_prompt(999, {"kind": "wizard", "index": 5, "data": {}})
+        self.wiz("value", 2)
+        self.assertEqual(self.s.session(999)["data"]["capacity"], 12)
+
+    def test_unauthorized_wizard_cannot_mutate(self):
+        self.app.admin_callback(999, ["new"])
+        token = self.s.session(999)["token"]
+        with self.assertRaises(RuleError):
+            self.app.wizard_callback(1, ["wiz", token, "skip"])
+        self.assertEqual(self.s.session(999)["index"], 0)
+
+    def test_start_cannot_reset_registered_level(self):
+        self.app.handle_message({"from": {"id": 1, "first_name": "Player"}, "chat": {"id": 1, "type": "private"}, "text": "/start"})
+        self.assertIsNone(self.s.session(1))
+        self.assertEqual(self.s.user(1)["level"], "C")
 
 
 if __name__ == "__main__":
     unittest.main()
+
