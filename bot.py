@@ -120,7 +120,7 @@ class App:
     def menu(self, uid):
         rows = [[("Ближайшие турниры", "events"), ("Мои регистрации", "mine")],
                 [("Моя очередь", "waiting"), ("Мой профиль", "profile")],
-                [("Мой Рейтинг 🏆", "ranking:all:0")]]
+                [("Мой Рейтинг 🏆", "ranking:all:0"), ("Мои результаты", "history:0")]]
         if uid in self.admins:
             rows.append([("Как считается рейтинг", "rating_rules")])
             rows.append([("Админка", "admin")])
@@ -395,6 +395,30 @@ class App:
                      [("В основной состав", f"move:{eid}:{target}:go")],
                      [("В неуверенные", f"move:{eid}:{target}:queue"), ("Не идёт", f"move:{eid}:{target}:no")]]
         self.send(uid, text, kb(rows))
+
+    def personal_history(self, uid, page=0):
+        history = self.s.player_history(uid, page)
+        lines = [f"<b>Мои результаты 🎾</b> · {history['page']+1}/{history['pages']}"]
+        if not history["rows"]:
+            lines.append("История появится после того, как администратор подтвердит ваши итоговые места в турнире.")
+        for row in history["rows"]:
+            date = datetime.fromtimestamp(row["start"], TZ).strftime("%d.%m.%Y") if row["start"] else "Без даты"
+            delta = f"{row['delta']:+.2f}" if abs(row["delta"]) >= 0.005 else "0.00"
+            label = esc(row["format"][:40])
+            court = " · " + esc(row["court"][:40]) if row["court"] else ""
+            lines.append(f"\n<b>{date} · {label} · №{row['event_id']}</b>{court}\n"
+                         f"Место: {row['place']} из {row['participants']}\n"
+                         f"Рейтинг: {row['before_rating']:.2f} → {row['after_rating']:.2f} ({delta}) · {esc(row['level'])}")
+        rows = []
+        nav = []
+        if history["page"]:
+            nav.append(("←", f"history:{history['page']-1}"))
+        if history["page"]+1 < history["pages"]:
+            nav.append(("→", f"history:{history['page']+1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([("Мой профиль", "profile"), ("Меню", "menu")])
+        self.send(uid, "\n".join(lines), kb(rows))
 
     def rating_profile_text(self, uid):
         rating = self.s.rating_profile(uid)
@@ -1032,6 +1056,8 @@ class App:
             elif parts[1] not in ("events", "mine", "waiting"):
                 raise RuleError("Неизвестный раздел.")
             self.event_list(uid, parts[1], int(parts[2]))
+        elif action == "history":
+            self.personal_history(uid, int(parts[1]))
         elif action == "profile":
             u = self.s.user(uid)
             if not u["level"]:
@@ -1039,7 +1065,8 @@ class App:
             else:
                 self.send(uid, player(u) + f"\n🎾 Сыграно турниров: {self.s.tournaments_played(uid)}"
                           + "\n" + self.rating_profile_text(uid)
-                          + "\nБуквенный уровень обновляется автоматически по текущему рейтингу после учтённых турниров.")
+                          + "\nБуквенный уровень обновляется автоматически по текущему рейтингу после учтённых турниров.",
+                          kb([[("Мои результаты", "history:0"), ("Меню", "menu")]]))
         elif action == "skip_name":
             s = self.s.session(uid)
             if not s or s["kind"] != "register" or s["step"] != "name":
@@ -1278,7 +1305,8 @@ class App:
                 continue
             try:
                 keyboard = json.loads(n["keyboard"]) if n["keyboard"] else kb([[("Турниры", "events")]])
-                self.send(n["user_id"], esc(n["text"]) if n["kind"] != "broadcast" else n["text"], keyboard)
+                text = self.s.personal_result_message(n["event_id"], n["user_id"], updated=n["text"] == "updated") if n["kind"] == "personal_result" else n["text"]
+                self.send(n["user_id"], esc(text) if n["kind"] != "broadcast" else text, keyboard)
                 self.s.notification_result(n, "sent")
             except APIError as exc:
                 permanent = exc.code in (400, 403) or n["attempts"] >= 7
@@ -1422,6 +1450,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

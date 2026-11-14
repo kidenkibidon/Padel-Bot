@@ -989,9 +989,97 @@ class DomainTests(unittest.TestCase):
         self.assertIn("недоступна", self.api.calls[-1][1]["text"])
         self.assertTrue(self.api.calls[-1][1]["show_alert"])
 
+    def completed_history_event(self, offset=0, winner=1):
+        data = dict(self.data, start=self.data["start"]+offset*86400,
+                    close_at=self.data["close_at"]+offset*86400, levels=[])
+        eid = self.s.save_event(999, data)
+        self.s.publish(999, eid)
+        for uid in (1,2):
+            self.s.join(eid, uid, "go")
+        self.s.save_results(999, eid, {1:1 if winner==1 else 2,2:2 if winner==1 else 1}, [1,2], {})
+        return eid
+
+    def test_personal_history_own_results_chronology_pagination_and_restart(self):
+        ids = [self.completed_history_event(i) for i in range(7)]
+        first = self.s.player_history(1)
+        self.assertEqual(first["total"], 7)
+        self.assertEqual(first["pages"], 2)
+        self.assertEqual([r["event_id"] for r in first["rows"]], list(reversed(ids))[0:5])
+        self.assertTrue(all(r["user_id"]==1 and r["place"]==1 and r["participants"]==2 for r in first["rows"]))
+        second = self.s.player_history(1, 1)
+        self.assertEqual(len(second["rows"]), 2)
+        self.assertEqual(self.s.player_history(3)["total"], 0)
+        self.assertEqual(self.s.player_history(1, 999)["page"], 1)
+        restored = Store(self.path, lambda: self.now)
+        self.assertEqual(restored.player_history(1)["total"], 7)
+        self.assertEqual(restored.player_history(2)["rows"][0]["place"], 2)
+
+    def test_result_notice_once_and_no_duplicates_after_same_save_or_restart(self):
+        eid = self.completed_history_event()
+        pending = [n for n in self.s.due_notifications() if n["kind"]=="personal_result"]
+        self.assertEqual(len(pending), 2)
+        self.assertEqual({n["user_id"] for n in pending}, {1,2})
+        self.assertTrue(all(self.s.notification_valid(n) for n in pending))
+        self.s.save_results(999, eid, {1:1,2:2}, [1,2], {1:1,2:2})
+        self.assertEqual(len([n for n in self.s.due_notifications() if n["kind"]=="personal_result"]), 2)
+        self.app.deliver()
+        messages = [p for m,p in self.api.calls if m=="sendMessage"]
+        self.assertEqual(len(messages), 2)
+        self.assertTrue(all(p["chat_id"] in (1,2) for p in messages))
+        self.assertIn("Ваше место: 1 из 2", messages[0]["text"])
+        self.assertIn("2.75 → 2.85", messages[0]["text"])
+        self.assertIn("history:0", str(messages[0]["reply_markup"]))
+        self.assertEqual(Store(self.path, lambda: self.now).due_notifications(), [])
+
+    def test_result_corrections_replace_pending_notice_and_refresh_history(self):
+        eid = self.completed_history_event()
+        old = [n for n in self.s.due_notifications() if n["kind"]=="personal_result"][0]
+        self.s.save_results(999, eid, {1:2,2:1}, [1,2], {1:1,2:2})
+        self.assertFalse(self.s.notification_valid(old))
+        self.assertEqual(self.s.player_history(1)["rows"][0]["place"], 2)
+        pending = [n for n in self.s.due_notifications() if n["kind"]=="personal_result"]
+        self.assertEqual(len(pending), 2)
+        self.app.deliver()
+        messages = [p for m,p in self.api.calls if m=="sendMessage" and p["chat_id"]==1]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Итоги турнира обновлены", messages[0]["text"])
+        self.assertIn("Ваше место: 2 из 2", messages[0]["text"])
+        self.assertIn("2.75 → 2.65", messages[0]["text"])
+
+    def test_queued_result_text_uses_latest_replayed_rating_history(self):
+        first = self.completed_history_event(0)
+        second = self.completed_history_event(1)
+        queued = [n for n in self.s.due_notifications() if n["event_id"]==second and n["user_id"]==1][0]
+        self.s.save_results(999, first, {1:2,2:1}, [1,2], {1:1,2:2})
+        self.assertTrue(self.s.notification_valid(queued))
+        self.assertIn("2.65 →", self.s.personal_result_message(second, 1))
+        self.assertAlmostEqual(self.s.player_history(1)["rows"][0]["before_rating"], 2.65)
+
+    def test_history_ui_private_only_no_payment_changes_or_disclosure(self):
+        eid = self.completed_history_event()
+        self.s.paid(999, eid, 1, True)
+        before = self.s.entry(eid, 1)
+        self.app.callback({"id":"q", "from":{"id":1}, "data":"history:0",
+                           "message":{"chat":{"id":1,"type":"private"}}})
+        message = self.api.calls[-1][1]
+        self.assertEqual(message["chat_id"], 1)
+        self.assertIn("Место: 1 из 2", message["text"])
+        self.assertNotIn("Оплата", message["text"])
+        self.assertNotIn("Оплачено", message["text"])
+        self.assertEqual(self.s.entry(eid, 1)["paid_amount"], before["paid_amount"])
+        self.assertEqual(self.s.entry(eid, 1)["paid"], 1)
+        self.api.calls.clear()
+        self.app.handle({"callback_query":self.group_query("history:0", 1)})
+        self.assertFalse(any(m=="sendMessage" and p["chat_id"]<0 for m,p in self.api.calls))
+        self.assertEqual(self.api.calls[-1][0], "answerCallbackQuery")
+        self.assertNotIn("Место: 1 из 2", self.api.calls[-1][1]["text"])
+        self.app.personal_history(3)
+        self.assertIn("История появится", self.api.calls[-1][1]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

@@ -329,6 +329,17 @@ class Store:
             c.execute("UPDATE entries SET status='ready',offer_until=NULL WHERE event_id=? AND status='offered'", (eid,))
             c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND kind IN ('offer','reminder','results_request') AND state='pending'", (eid,))
             self._rebuild_ratings(c)
+            if saved != places:
+                key = f"result_notice_revision:{eid}"
+                old_revision = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+                revision = (json.loads(old_revision[0]) if old_revision else 0) + 1
+                c.execute("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, json.dumps(revision)))
+                c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND kind='personal_result' AND state='pending'", (eid,))
+                keyboard = {"inline_keyboard": [[{"text": "Мои результаты", "callback_data": "history:0"},
+                                                  {"text": "Мой профиль", "callback_data": "profile"}]]}
+                for uid in places:
+                    self.enqueue(c, f"personal_result:{eid}:{revision}:{uid}", uid,
+                                 "updated" if saved else "initial", "personal_result", eid, revision, keyboard=keyboard)
             self.audit(c, actor, "results", [eid, places])
 
     @staticmethod
@@ -408,6 +419,48 @@ class Store:
     def event_rating_changes(self, eid):
         with self.db() as c:
             return {r["user_id"]:dict(r) for r in c.execute("SELECT * FROM rating_history WHERE event_id=?", (eid,))}
+
+    @staticmethod
+    def _history_rows(c, uid, eid=None, limit=5, offset=0):
+        sql = """SELECT h.*,r.place,e.data,
+                 (SELECT count(*) FROM event_results p WHERE p.event_id=e.id) AS participants
+                 FROM rating_history h JOIN events e ON e.id=h.event_id
+                 JOIN event_results r ON r.event_id=h.event_id AND r.user_id=h.user_id
+                 WHERE h.user_id=? AND e.status='completed'"""
+        args = [uid]
+        if eid is not None:
+            sql += " AND e.id=?"
+            args.append(eid)
+        sql += " ORDER BY json_extract(e.data,'$.start') DESC,e.id DESC LIMIT ? OFFSET ?"
+        args.extend([limit, offset])
+        rows = []
+        for row in c.execute(sql, args):
+            data = json.loads(row["data"])
+            rows.append({**dict(row), "start":data.get("start"), "format":data.get("format") or "Турнир",
+                         "court":data.get("court") or "", "level":level_for_rating(row["after_rating"])})
+        return rows
+
+    def player_history(self, uid, page=0, page_size=5):
+        with self.db() as c:
+            total = c.execute("""SELECT count(*) FROM rating_history h JOIN events e ON e.id=h.event_id
+                                WHERE h.user_id=? AND e.status='completed'""", (uid,)).fetchone()[0]
+            pages = max(1, (total+page_size-1)//page_size)
+            page = min(max(page, 0), pages-1)
+            return {"total":total, "page":page, "pages":pages,
+                    "rows":self._history_rows(c, uid, limit=page_size, offset=page*page_size)}
+
+    def personal_result_message(self, eid, uid, updated=False):
+        with self.db() as c:
+            rows = self._history_rows(c, uid, eid=eid, limit=1)
+        if not rows:
+            raise RuleError("Результат не найден.")
+        row = rows[0]
+        date = datetime.fromtimestamp(row["start"], ZoneInfo("Asia/Dubai")).strftime("%d.%m.%Y") if row["start"] else ""
+        delta = f"{row['delta']:+.2f}" if abs(row["delta"]) >= 0.005 else "0.00"
+        title = "Итоги турнира обновлены 🎾" if updated else "Турнир завершён 🎾"
+        return (f"{title}\n{date} · {row['format']} · №{eid}\n{row['court']}\n"
+                f"Ваше место: {row['place']} из {row['participants']}\n"
+                f"Рейтинг за турнир: {row['before_rating']:.2f} → {row['after_rating']:.2f} ({delta}) · {row['level']}")
 
     def request_results(self, c, eid):
         admins = c.execute("SELECT value FROM settings WHERE key='result_admins'").fetchone()
@@ -594,6 +647,12 @@ class Store:
     def notification_valid(self, n):
         if n["expires"] and n["expires"] <= self.clock():
             return False
+        if n["kind"] == "personal_result":
+            revision = self.get_setting(f"result_notice_revision:{n['event_id']}")
+            if revision != n["revision"]:
+                return False
+            with self.db() as c:
+                return bool(self._history_rows(c, n["user_id"], eid=n["event_id"], limit=1))
         if n["event_id"] and n["kind"] in ("offer", "reminder"):
             e = self.event(n["event_id"])
             en = self.entry(n["event_id"], n["user_id"])
@@ -628,6 +687,7 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+
 
 
 
