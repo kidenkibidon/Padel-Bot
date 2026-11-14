@@ -39,7 +39,7 @@ def main():
                     raise SystemExit("Настройка отменена.")
                 value = (f"BOT_TOKEN={token}\nOWNER_ID={owner}\nADMIN_IDS=\n"
                          "GROUP_ID=\nDB_PATH=data/padel.sqlite3\n"
-                         "LEVELS=D,D+,C-,C,C+,B-,B,B+,A\n")
+                         "LEVELS=D,D+,C,C+,B-,B,B+,A\n")
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "w") as f:
                     f.write(value)
