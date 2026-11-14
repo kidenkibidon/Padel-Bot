@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Запустите через sudo bash deploy/install.sh"
+  echo "Запустите через sudo bash install.sh"
   exit 1
 fi
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
 /usr/bin/python3 -c 'import sys; assert sys.version_info >= (3,11), "Нужен Python 3.11+"; from zoneinfo import ZoneInfo; ZoneInfo("Asia/Dubai")'
 if [ ! -f .env ] && [ ! -f /opt/padel-escape/.env ]; then
   echo "Сначала выполните python3 configure.py в папке проекта."
@@ -16,13 +16,23 @@ fi
 install -d -m 0755 /opt/padel-escape
 install -d -o padelbot -g padelbot -m 0700 /opt/padel-escape/data
 systemctl stop padel-escape.service 2>/dev/null || true
-install -m 0644 core.py bot.py backup.py /opt/padel-escape/
+# Preserve the pre-update code and local data while the service is stopped.
+if [ -f /opt/padel-escape/bot.py ]; then
+  archive_dir="/opt/padel-escape/rollback-$(date -u +%Y%m%dT%H%M%SZ)"
+  install -d -m 0700 "$archive_dir"
+  cp -a /opt/padel-escape/*.py "$archive_dir/"
+  if [ -f /opt/padel-escape/.env ]; then cp -a /opt/padel-escape/.env "$archive_dir/"; fi
+  if [ -d /opt/padel-escape/data ]; then cp -a /opt/padel-escape/data "$archive_dir/"; fi
+fi
+install -m 0644 core.py bot.py scheduling.py storage.py backup.py migrate_turso.py requirements.txt /opt/padel-escape/
+/usr/bin/python3 -m venv /opt/padel-escape/venv
+/opt/padel-escape/venv/bin/pip install -r /opt/padel-escape/requirements.txt
 if [ ! -f /opt/padel-escape/.env ]; then
   install -o padelbot -g padelbot -m 0600 .env /opt/padel-escape/.env
 fi
-install -m 0644 deploy/padel-escape.service /etc/systemd/system/padel-escape.service
+install -m 0644 padel-escape.service /etc/systemd/system/padel-escape.service
 cd /opt/padel-escape
-runuser -u padelbot -- /usr/bin/python3 bot.py --check
+runuser -u padelbot -- /opt/padel-escape/venv/bin/python bot.py --check
 systemctl daemon-reload
 systemctl enable --now padel-escape.service
 systemctl --no-pager status padel-escape.service

@@ -1,0 +1,36 @@
+name: Check bot worker and keep web service awake
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '2-57/5 * * * *'
+permissions: {}
+concurrency:
+  group: bot-health
+  cancel-in-progress: false
+jobs:
+  ping:
+    if: ${{ vars.BOT_HEALTH_URL != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    env:
+      BOT_HEALTH_URL: ${{ vars.BOT_HEALTH_URL }}
+    steps:
+      - name: Check worker heartbeat
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.request
+          import urllib.parse
+          url = os.environ['BOT_HEALTH_URL']
+          parsed = urllib.parse.urlsplit(url)
+          if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password:
+              raise SystemExit('BOT_HEALTH_URL must be a public HTTPS health URL without credentials')
+          try:
+              with urllib.request.urlopen(url, timeout=150) as response:
+                  if response.status != 200 or response.read(128).strip() != b'ok':
+                      raise SystemExit('Worker health check failed')
+          except Exception:
+              raise SystemExit('Worker is unreachable or unhealthy') from None
+          print('Worker is healthy')
+          PY
