@@ -479,7 +479,7 @@ class DomainTests(unittest.TestCase):
         message = {"from": {"id": 999}, "chat": {"id": -123, "type": "supergroup"}, "text": "/bind"}
         self.app.handle_message(message)
         self.app.handle_message(message)
-        posts = [p for m,p in self.api.calls if m == "sendMessage" and "Выберите свой рейтинг" in p["text"]]
+        posts = [p for m,p in self.api.calls if m == "sendMessage" and "Выберите свой уровень игры" in p["text"]]
         self.assertEqual(len(posts), 1)
         self.assertEqual(sum(m == "pinChatMessage" for m,p in self.api.calls), 2)
         self.assertEqual(self.s.user(1)["level"], "C")
@@ -631,9 +631,120 @@ class DomainTests(unittest.TestCase):
         buttons = self.api.calls[-1][1]["reply_markup"]["inline_keyboard"]
         self.assertEqual(buttons[0][0]["callback_data"], f"ae:{self.eid}")
 
+    def test_rating_strength_bonus_and_favorite_loss_are_bounded(self):
+        places = {1:1, 2:2, 3:3, 4:4, 5:5}
+        equal = Store.rating_changes({uid:2.0 for uid in places}, places)
+        upset = Store.rating_changes({1:2.0, 2:3.5, 3:3.5, 4:3.5, 5:3.5}, places)
+        self.assertAlmostEqual(equal[1], 0.1)
+        self.assertGreater(upset[1], 0.19)
+        self.assertLess(upset[1], 0.20)
+        favorite_loss = Store.rating_changes({1:2.0,2:2.0,3:2.0,4:2.0,5:3.5}, places)
+        self.assertLess(favorite_loss[5], equal[5])
+        self.assertGreaterEqual(favorite_loss[5], -0.20)
+        self.assertAlmostEqual(sum(equal.values()), 0.0)
+        self.assertAlmostEqual(sum(upset.values()), 0.0)
+        for count in (2,4,8,12,24):
+            values = Store.rating_changes({uid:2.0 for uid in range(count)}, {uid:uid+1 for uid in range(count)})
+            self.assertAlmostEqual(values[0], 0.1)
+            self.assertTrue(all(abs(delta) <= 0.2 for delta in values.values()))
+
+    def test_rating_ties_single_player_and_zero_floor(self):
+        tied = Store.rating_changes({1:2.0,2:2.0}, {1:1,2:1})
+        self.assertEqual(tied, {1:0.0,2:0.0})
+        self.assertEqual(Store.rating_changes({1:2.0}, {1:1}), {1:0.0})
+        low = Store.rating_changes({1:0.01,2:0.01}, {1:2,2:1})
+        self.assertEqual(low[1], -0.01)
+
+    def test_rating_uses_only_confirmed_results_never_attendance(self):
+        self.s.join(self.eid, 1, "go")
+        self.s.join(self.eid, 2, "go")
+        self.s.change_status(999, self.eid, "completed")
+        self.assertEqual(self.s.rating_profile(1)["rating"], 2.0)
+        self.assertEqual(self.s.rating_profile(1)["rated_events"], 0)
+        self.assertEqual(self.s.leaderboard(), [])
+        self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
+        self.assertAlmostEqual(self.s.rating_profile(1)["rating"], 2.1)
+        self.assertAlmostEqual(self.s.rating_profile(2)["rating"], 1.9)
+        self.assertEqual(self.s.rating_profile(1)["wins"], 1)
+        self.assertEqual(self.s.rating_profile(1)["rank"], 1)
+        self.assertEqual(self.s.rating_profile(2)["rank"], 2)
+        self.assertEqual(self.s.rating_profile(3)["rating"], 2.0)
+        self.assertIsNone(self.s.rating_profile(3)["rank"])
+        self.assertEqual(self.s.rating_profile(3)["rated_events"], 0)
+
+    def test_historical_correction_replays_later_events_without_double_credit(self):
+        for uid in (1,2):
+            self.s.join(self.eid, uid, "go")
+        self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
+        second = self.s.save_event(999, dict(self.data, start=self.data["start"]+86400, close_at=self.data["close_at"]+86400))
+        self.s.publish(999, second)
+        for uid in (1,2):
+            self.s.join(second, uid, "go")
+        self.s.save_results(999, second, {1:1,2:2}, [1,2], {})
+        self.assertAlmostEqual(self.s.event_rating_changes(second)[1]["before_rating"], 2.1)
+        self.s.save_results(999, self.eid, {1:2,2:1}, [1,2], {1:1,2:2})
+        history = self.s.event_rating_changes(second)
+        self.assertAlmostEqual(history[1]["before_rating"], 1.9)
+        expected = 1.9 + Store.rating_changes({1:1.9,2:2.1}, {1:1,2:2})[1]
+        self.assertAlmostEqual(self.s.rating_profile(1)["rating"], expected)
+        self.assertEqual(self.s.rating_profile(1)["rated_events"], 2)
+        self.assertEqual(self.s.rating_profile(1)["wins"], 1)
+        self.s.save_results(999, self.eid, {1:2,2:1}, [1,2], {1:2,2:1})
+        self.assertAlmostEqual(self.s.rating_profile(1)["rating"], expected)
+        self.now += 365*86400*5
+        restored = Store(self.path, lambda: self.now)
+        self.assertAlmostEqual(restored.rating_profile(1)["rating"], expected)
+        self.assertEqual(restored.rating_profile(1)["rated_events"], 2)
+
+    def test_ratings_rebuild_in_playing_order_even_if_results_entered_late(self):
+        for uid in (1,2):
+            self.s.join(self.eid, uid, "go")
+        second = self.s.save_event(999, dict(self.data, start=self.data["start"]+86400, close_at=self.data["close_at"]+86400))
+        self.s.publish(999, second)
+        for uid in (1,2):
+            self.s.join(second, uid, "go")
+        self.s.save_results(999, second, {1:1,2:2}, [1,2], {})
+        self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
+        self.assertAlmostEqual(self.s.event_rating_changes(self.eid)[1]["before_rating"], 2.0)
+        self.assertAlmostEqual(self.s.event_rating_changes(second)[1]["before_rating"], 2.1)
+        self.assertEqual(self.s.rating_profile(1)["rated_events"], 2)
+
+    def test_rating_ui_profiles_group_access_and_level_filter(self):
+        for uid in (1,2):
+            self.s.join(self.eid, uid, "go")
+        self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
+        self.s.set_level(999, 2, "B")
+        self.assertEqual([r["user_id"] for r in self.s.leaderboard("C")], [1])
+        self.app.person(999, 1)
+        self.assertIn("Рейтинг группы: 2.10", self.api.calls[-1][1]["text"])
+        self.app.callback({"id":"q", "from":{"id":1,"first_name":"Player"}, "data":"ranking:all:0",
+                           "message":{"chat":{"id":-123,"type":"supergroup"}}})
+        self.assertEqual(self.api.calls[-1][1]["chat_id"], -123)
+        self.assertIn("2.10", self.api.calls[-1][1]["text"])
+        with self.assertRaises(RuleError):
+            self.app.callback({"id":"q", "from":{"id":1}, "data":"ranking:all:0",
+                               "message":{"chat":{"id":-999,"type":"supergroup"}}})
+        saved = self.app.results_text(self.eid, self.s.results(self.eid))
+        preview = self.app.results_text(self.eid, self.s.results(self.eid), include_rating=False)
+        self.assertIn("+0.10", saved)
+        self.assertNotIn("+0.10", preview)
+
+    def test_rating_migration_populates_existing_result_history(self):
+        for uid in (1,2):
+            self.s.join(self.eid, uid, "go")
+        self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
+        with self.s.db() as c:
+            c.execute("DELETE FROM player_ratings")
+            c.execute("DELETE FROM rating_history")
+            c.execute("DELETE FROM settings WHERE key='rating_algorithm'")
+        restored = Store(self.path, lambda: self.now)
+        self.assertAlmostEqual(restored.rating_profile(1)["rating"], 2.1)
+        self.assertEqual(len(restored.event_rating_changes(self.eid)), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

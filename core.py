@@ -35,6 +35,13 @@ class Store:
               event_id INTEGER NOT NULL REFERENCES events(id),
               user_id INTEGER NOT NULL REFERENCES users(id), place INTEGER NOT NULL CHECK(place>0),
               PRIMARY KEY(event_id,user_id));
+            CREATE TABLE IF NOT EXISTS player_ratings(
+              user_id INTEGER PRIMARY KEY REFERENCES users(id), rating REAL NOT NULL,
+              rated_events INTEGER NOT NULL, wins INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS rating_history(
+              event_id INTEGER NOT NULL REFERENCES events(id), user_id INTEGER NOT NULL REFERENCES users(id),
+              before_rating REAL NOT NULL, after_rating REAL NOT NULL, delta REAL NOT NULL,
+              PRIMARY KEY(event_id,user_id));
             CREATE TABLE IF NOT EXISTS sessions(user_id INTEGER PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(
@@ -47,6 +54,10 @@ class Store:
               id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
               actor INTEGER NOT NULL, action TEXT NOT NULL, detail TEXT NOT NULL);
             """)
+        if self.get_setting("rating_algorithm") != "community-v1":
+            with self.db() as c:
+                self._rebuild_ratings(c)
+                c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v1"),))
 
     @contextmanager
     def db(self):
@@ -270,7 +281,79 @@ class Store:
             c.execute("UPDATE events SET status='completed',dirty=1 WHERE id=?", (eid,))
             c.execute("UPDATE entries SET status='ready',offer_until=NULL WHERE event_id=? AND status='offered'", (eid,))
             c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND kind IN ('offer','reminder','results_request') AND state='pending'", (eid,))
+            self._rebuild_ratings(c)
             self.audit(c, actor, "results", [eid, places])
+
+    @staticmethod
+    def rating_changes(before, places):
+        """Tournament-normalized Elo-style update, not official padel skill ratings.
+
+        Every opponent contributes equally. K=0.20 is the *whole event* cap;
+        all expectations use pre-event values, including ties. No attendance bonus.
+        """
+        count = len(places)
+        if count < 2:
+            return {uid: 0.0 for uid in places}
+        changes = {}
+        for uid, place in places.items():
+            score = expected = 0.0
+            for other, other_place in places.items():
+                if other == uid:
+                    continue
+                score += 1.0 if place < other_place else 0.5 if place == other_place else 0.0
+                gap = max(-12.0, min(12.0, before[other]-before[uid]))
+                expected += 1.0 / (1.0 + 10.0 ** gap)
+            delta = 0.20 * (score-expected) / (count-1)
+            changes[uid] = max(-before[uid], delta)  # Ratings never drop below zero.
+        return changes
+
+    def _rebuild_ratings(self, c):
+        # Replay in game-date order so correcting an old result adjusts later expectations.
+        c.execute("DELETE FROM rating_history")
+        c.execute("DELETE FROM player_ratings")
+        ratings, counts, wins = {}, {}, {}
+        events = [self._event(c, r[0]) for r in c.execute(
+            "SELECT DISTINCT e.id FROM events e JOIN event_results r ON r.event_id=e.id WHERE e.status='completed'").fetchall()]
+        for event in sorted(events, key=lambda e: (e["start"], e["id"])):
+            places = {r[0]:r[1] for r in c.execute(
+                "SELECT user_id,place FROM event_results WHERE event_id=? ORDER BY user_id", (event["id"],))}
+            before = {uid: ratings.get(uid, 2.0) for uid in places}
+            changes = self.rating_changes(before, places)
+            for uid in places:
+                after = before[uid] + changes[uid]
+                ratings[uid] = after
+                counts[uid] = counts.get(uid, 0) + (1 if len(places) >= 2 else 0)
+                wins[uid] = wins.get(uid, 0) + (1 if places[uid] == 1 and len(places) >= 2 else 0)
+                c.execute("INSERT INTO rating_history VALUES(?,?,?,?,?)",
+                          (event["id"], uid, before[uid], after, changes[uid]))
+        c.executemany("INSERT INTO player_ratings VALUES(?,?,?,?)",
+                      [(uid,value,counts[uid],wins[uid]) for uid,value in ratings.items()])
+
+    def rating_profile(self, uid):
+        with self.db() as c:
+            row = c.execute("SELECT * FROM player_ratings WHERE user_id=?", (uid,)).fetchone()
+            result = dict(row) if row else dict(user_id=uid, rating=2.0, rated_events=0, wins=0)
+            last = c.execute("""SELECT h.delta FROM rating_history h JOIN events e ON e.id=h.event_id
+                WHERE h.user_id=? ORDER BY json_extract(e.data,'$.start') DESC,e.id DESC LIMIT 1""", (uid,)).fetchone()
+            result["last_delta"] = last[0] if last else 0.0
+            result["rank"] = (1+c.execute("SELECT count(*) FROM player_ratings WHERE rated_events>0 AND rating>?",
+                                         (result["rating"]+1e-10,)).fetchone()[0]) if result["rated_events"] else None
+            return result
+
+    def leaderboard(self, level=None):
+        with self.db() as c:
+            sql = """SELECT r.*,u.display,u.level FROM player_ratings r JOIN users u ON u.id=r.user_id
+                     WHERE r.rated_events>0"""
+            args = ()
+            if level:
+                sql += " AND u.level=?"
+                args = (level,)
+            sql += " ORDER BY r.rating DESC,r.user_id"
+            return [dict(r) for r in c.execute(sql, args)]
+
+    def event_rating_changes(self, eid):
+        with self.db() as c:
+            return {r["user_id"]:dict(r) for r in c.execute("SELECT * FROM rating_history WHERE event_id=?", (eid,))}
 
     def request_results(self, c, eid):
         admins = c.execute("SELECT value FROM settings WHERE key='result_admins'").fetchone()
@@ -485,6 +568,7 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+
 
 
 

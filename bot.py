@@ -119,7 +119,8 @@ class App:
 
     def menu(self, uid):
         rows = [[("Ближайшие турниры", "events"), ("Мои регистрации", "mine")],
-                [("Моя очередь", "waiting"), ("Мой профиль", "profile")]]
+                [("Моя очередь", "waiting"), ("Мой профиль", "profile")],
+                [("🏆 Рейтинг группы", "ranking:all:0"), ("Как считается рейтинг", "rating_rules")]]
         if uid in self.admins:
             rows.append([("Админка", "admin")])
         return self.send(uid, "🎾 <b>PADEL ESCAPE</b>\nВыберите действие:", kb(rows))
@@ -380,6 +381,7 @@ class App:
             raise RuleError("Игрок не найден.")
         text = player(u) + f"\nID: <code>{target}</code>"
         text += f"\n🎾 Сыграно турниров: {self.s.tournaments_played(target)}"
+        text += "\n" + self.rating_profile_text(target)
         rows = [[("Изменить уровень", f"changelevel:{target}")]]
         if u["dm_error"]:
             text += "\n⚠ Личные сообщения не доставлены."
@@ -393,18 +395,73 @@ class App:
                      [("В неуверенные", f"move:{eid}:{target}:queue"), ("Не идёт", f"move:{eid}:{target}:no")]]
         self.send(uid, text, kb(rows))
 
-    def results_text(self, eid, places):
+    def rating_profile_text(self, uid):
+        rating = self.s.rating_profile(uid)
+        text = f"⭐ Рейтинг группы: {rating['rating']:.2f}"
+        if rating["rank"] is not None:
+            text += f"\n📊 Место в группе: {rating['rank']}"
+            delta = rating["last_delta"]
+            text += f"\nПоследний турнир: {delta:+.2f}" if abs(delta) >= 0.005 else "\nПоследний турнир: 0.00"
+        text += f"\n🏆 Побед: {rating['wins']} · Турниров в рейтинге: {rating['rated_events']}"
+        if rating["rated_events"] < 3:
+            text += "\nПредварительный рейтинг: первые 3 турнира."
+        return text
+
+    def ranking(self, chat, level="all", page=0):
+        if level != "all" and level not in self.levels:
+            raise RuleError("Неизвестный уровень фильтра.")
+        players = self.s.leaderboard(None if level == "all" else level)
+        pages = max(1, (len(players)+9)//10)
+        page = min(max(page, 0), pages-1)
+        text = [f"<b>🏆 Рейтинг группы · {esc(level) if level != 'all' else 'Все уровни'}</b>",
+                f"Страница {page+1}/{pages} · без срока действия"]
+        for i, player in enumerate(players[page*10:(page+1)*10], start=page*10+1):
+            name = player["display"].replace("@", "＠")[:40]
+            flag = " · предвар." if player["rated_events"] < 3 else ""
+            text.append(f"{i}. {esc(name)} · <b>{player['rating']:.2f}</b> · {esc(player.get('level') or '—')}{flag}")
+        if not players:
+            text.append("Пока нет результатов. Рейтинг появится после подтверждения итогов турнира.")
+        rows = [[("Все", "ranking:all:0")]]
+        filters = [(value, f"ranking:{value}:0") for value in self.levels]
+        rows += [filters[i:i+4] for i in range(0, len(filters), 4)]
+        nav = []
+        if page:
+            nav.append(("←", f"ranking:{level}:{page-1}"))
+        if page+1 < pages:
+            nav.append(("→", f"ranking:{level}:{page+1}"))
+        if nav:
+            rows.append(nav)
+        rows.append([("Как считается рейтинг", "rating_rules")])
+        self.send(chat, "\n".join(text), kb(rows))
+
+    def rating_rules(self, chat):
+        self.send(chat, "<b>Как считается рейтинг группы</b>\n"
+                  "Старт: 2.00. Срока действия и сезонного обнуления нет.\n"
+                  "После подтверждения итогов сравнивается ваше место с местами всех соперников и их рейтингами ДО турнира.\n"
+                  "Победа над сильными даёт больше, чем победа над равными. Низкое место фаворита списывает больше.\n"
+                  "Изменение за один турнир ограничено ±0.20; рейтинг не опускается ниже нуля. Отдельных очков за участие нет.\n"
+                  "При одинаковых местах сравнение считается ничьей. Первые 3 турнира рейтинг предварительный.\n"
+                  "При исправлении старых результатов пересчитывается вся последующая история, без повторных начислений.\n"
+                  "Уровень D–B+ меняется администратором отдельно. Это внутренний рейтинг сообщества, а не официальная шкала навыка.")
+
+    def results_text(self, eid, places, include_rating=True):
         names = {r["user_id"]: r["display"] for r in self.s.entries(eid)}
         if not places:
             return "<b>Итоговые места пока не указаны.</b>"
         rows = ["<b>🏆 Результаты турнира</b>"]
+        changes = self.s.event_rating_changes(eid) if include_rating else {}
         for uid, place in sorted(places.items(), key=lambda item: (item[1], item[0])):
             name = names.get(uid, "Игрок").replace("@", "＠")
             short = name
-            while len(esc(short)) > 100:
+            while len(esc(short)) > 70:
                 short = short[:-1]
             label = esc(short) + ("…" if short != name else "")
-            rows.append(f"{place} место — {label}")
+            line = f"{place} место — {label}"
+            if uid in changes:
+                history = changes[uid]
+                delta = history["delta"]
+                line += f" · {history['after_rating']:.2f} ({delta:+.2f})" if abs(delta) >= 0.005 else f" · {history['after_rating']:.2f} (0.00)"
+            rows.append(line)
         return "\n".join(rows)
 
     def start_results(self, uid, eid):
@@ -440,7 +497,7 @@ class App:
                 text += f"\nСохранённое в форме место: {session['places'][str(target)]}"
         else:
             places = {int(k):v for k,v in session["places"].items()}
-            text = f"Турнир №{eid} · проверьте итоговые места\n\n" + self.results_text(eid, places)
+            text = f"Турнир №{eid} · проверьте итоговые места\n\n" + self.results_text(eid, places, include_rating=False)
             text += "\n\nПодтверждение сохранит результаты и завершит турнир."
             rows.append([("Подтвердить результаты", f"results_save:{token}")])
         if index > 0:
@@ -658,10 +715,11 @@ class App:
         self.admin_event(uid, eid)
 
     def registration_post(self, chat):
-        keyboard = {"inline_keyboard": [[{"text": "Выбрать рейтинг", "url": f"https://t.me/{self.username}?start=register"}]]}
+        keyboard = {"inline_keyboard": [[{"text": "Выбрать уровень игры", "url": f"https://t.me/{self.username}?start=register"}],
+                                         [{"text": "🏆 Рейтинг группы", "callback_data": "ranking:all:0"}]]}
         key = f"registration_post:{chat}"
         mid = self.s.get_setting(key)
-        text = "🎾 <b>PADEL ESCAPE</b>\nВыберите свой рейтинг один раз. Имя берётся из профиля Telegram.\nДалее изменить рейтинг сможет только администратор.\nНажмите кнопку и затем Start в личном чате бота."
+        text = "🎾 <b>PADEL ESCAPE</b>\nВыберите свой уровень игры D–B+ один раз. Имя берётся из профиля Telegram.\nДалее изменить уровень сможет только администратор.\nНажмите кнопку и затем Start в личном чате бота."
         if mid:
             try:
                 self.edit("editMessageText", chat_id=chat, message_id=mid, text=text, parse_mode="HTML", reply_markup=keyboard)
@@ -692,7 +750,7 @@ class App:
         keyboard = None
         text = esc(name) + ", добро пожаловать! 🎾"
         if not profile.get("level"):
-            text += "\nВыберите свой рейтинг один раз по кнопке ниже."
+            text += "\nВыберите свой уровень игры D–B+ один раз по кнопке ниже."
             keyboard = {"inline_keyboard": [[{"text": "Выбрать рейтинг", "url": f"https://t.me/{self.username}?start=register"}]]}
         self.send(chat, text, keyboard)
         self.s.setting(key, stamp)
@@ -715,6 +773,11 @@ class App:
         cmd = text.split()[0].split("@")[0] if text else ""
         if cmd == "/id":
             self.send(chat, f"Ваш Telegram ID: <code>{uid}</code>\nID чата: <code>{chat}</code>")
+            return
+        if cmd == "/rating":
+            if not private and int(self.s.get_setting("group_id", self.group) or 0) != chat:
+                raise RuleError("Рейтинг доступен в подключённой группе или личном чате бота.")
+            self.ranking(chat)
             return
         if not private:
             if cmd == "/bind":
@@ -852,6 +915,16 @@ class App:
         self.s.touch_user(q["from"], False)
         parts = q.get("data", "").split(":")
         action = parts[0]
+        if action in ("ranking", "rating_rules"):
+            chat = q.get("message", {}).get("chat", {}).get("id")
+            if not chat or (not private and int(self.s.get_setting("group_id", self.group) or 0) != chat):
+                raise RuleError("Откройте рейтинг в подключённой группе или личном чате.")
+            self.api.call("answerCallbackQuery", callback_query_id=q["id"])
+            if action == "ranking":
+                self.ranking(chat, parts[1], int(parts[2]))
+            else:
+                self.rating_rules(chat)
+            return
         # Public buttons never trigger private registration/admin state changes directly.
         if not private:
             if action not in ("go", "no", "queue", "list", "event"):
@@ -880,6 +953,7 @@ class App:
                 self.start_registration(uid)
             else:
                 self.send(uid, player(u) + f"\n🎾 Сыграно турниров: {self.s.tournaments_played(uid)}"
+                          + "\n" + self.rating_profile_text(uid)
                           + "\nДля изменения уровня обратитесь к администратору.")
         elif action == "skip_name":
             s = self.s.session(uid)
@@ -969,7 +1043,7 @@ class App:
                 self.s.save_results(uid, session["eid"], {int(k):v for k,v in session["places"].items()},
                                     session["participants"], {int(k):v for k,v in session["previous"].items()})
                 self.s.session(uid, clear=True)
-                self.send(uid, "Результаты сохранены. Турнир завершён, счётчики сыгранных турниров обновлены.")
+                self.send(uid, "Результаты сохранены. Турнир завершён, счётчики и рейтинг группы пересчитаны.")
                 self.admin_event(uid, session["eid"])
         elif a in ("close", "cancel_event"):
             eid = int(p[1])
@@ -1204,6 +1278,7 @@ def main():
         {"command": "start", "description": "Меню и регистрация"},
         {"command": "tournaments", "description": "Ближайшие турниры"},
         {"command": "my", "description": "Мои регистрации"},
+        {"command": "rating", "description": "Рейтинг группы"},
         {"command": "admin", "description": "Админка"},
         {"command": "id", "description": "Мой Telegram ID"},
         {"command": "cancel", "description": "Отменить текущий ввод"},
@@ -1254,6 +1329,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
