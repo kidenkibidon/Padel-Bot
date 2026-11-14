@@ -8,7 +8,7 @@ from contextlib import contextmanager
 
 
 LEVEL_START_RATINGS = {"D": 1.50, "D+": 2.25, "C": 2.75, "C+": 3.25,
-                       "B-": 4.25, "B": 4.25, "B+": 5.25, "A": 6.50}
+                       "B-": 4.50, "B": 4.00, "B+": 5.25, "A": 6.50}
 
 
 class RuleError(Exception):
@@ -64,10 +64,14 @@ class Store:
                 c.execute("ALTER TABLE users ADD COLUMN rating_seed REAL")
             for level, value in LEVEL_START_RATINGS.items():
                 c.execute("UPDATE users SET rating_seed=? WHERE level=? AND rating_seed IS NULL", (value, level))
-        if self.get_setting("rating_algorithm") != "community-v2-level-seeds":
+        if self.get_setting("rating_algorithm") != "community-v3-b-seeds":
             with self.db() as c:
+                # Correct the previous shared B/B- baseline once, then replay history.
+                for level in ("B", "B-"):
+                    c.execute("UPDATE users SET rating_seed=? WHERE level=? AND rating_seed=4.25",
+                              (LEVEL_START_RATINGS[level], level))
                 self._rebuild_ratings(c)
-                c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v2-level-seeds"),))
+                c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v3-b-seeds"),))
 
     @contextmanager
     def db(self):
@@ -592,6 +596,7 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+
 
 
 

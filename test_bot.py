@@ -742,7 +742,7 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(len(restored.event_rating_changes(self.eid)), 2)
 
     def test_level_start_midpoints_and_registration_cannot_reset_seed(self):
-        mapping = {"D":1.5,"D+":2.25,"C":2.75,"C+":3.25,"B-":4.25,"B":4.25,"B+":5.25,"A":6.5}
+        mapping = {"D":1.5,"D+":2.25,"C":2.75,"C+":3.25,"B-":4.50,"B":4.00,"B+":5.25,"A":6.5}
         for uid,(level,value) in enumerate(mapping.items(), start=101):
             self.s.touch_user({"id":uid,"first_name":level}, True)
             self.s.register(uid, "", level)
@@ -765,7 +765,7 @@ class DomainTests(unittest.TestCase):
         self.s.save_results(999, eid, {1:1,2:2}, [1,2], {})
         history = self.s.event_rating_changes(eid)
         self.assertEqual(history[1]["before_rating"], 1.5)
-        self.assertEqual(history[2]["before_rating"], 4.25)
+        self.assertEqual(history[2]["before_rating"], 4.00)
         self.assertGreater(history[1]["delta"], 0.19)
         # A later letter correction does not reset established competitive history.
         before = self.s.rating_profile(1)["rating"]
@@ -813,9 +813,29 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(migrated.rating_profile(101)["rating"], 5.25)
         self.assertEqual(Store(path, lambda: self.now).rating_profile(101)["rating"], 5.25)
 
+    def test_previous_b_baseline_migrates_and_replays_results_once(self):
+        self.s.set_level(999, 1, "B")
+        self.s.set_level(999, 2, "B-")
+        for uid in (1,2):
+            self.s.join(self.eid, uid, "go", force=True, actor=999)
+        self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
+        with self.s.db() as c:
+            c.execute("UPDATE users SET rating_seed=4.25 WHERE id IN (1,2)")
+            c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v2-level-seeds"),))
+        migrated = Store(self.path, lambda: self.now)
+        history = migrated.event_rating_changes(self.eid)
+        self.assertEqual(history[1]["before_rating"], 4.0)
+        self.assertEqual(history[2]["before_rating"], 4.5)
+        first = migrated.rating_profile(1)["rating"]
+        self.assertGreater(first, 4.1)
+        restarted = Store(self.path, lambda: self.now)
+        self.assertEqual(restarted.rating_profile(1)["rating"], first)
+        self.assertEqual(restarted.rating_profile(1)["rated_events"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 
