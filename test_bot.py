@@ -71,30 +71,24 @@ class DomainTests(unittest.TestCase):
         self.s.join(self.eid, 1, "go")
         self.assertEqual(len(self.s.entries(self.eid)), 1)
 
-    def test_ready_queue_confirmation_and_reservation(self):
+    def test_ready_queue_has_no_reservation_and_first_click_wins(self):
         self.fill()
-        self.s.join(self.eid, 5, "go")
-        self.now += 1
-        self.s.join(self.eid, 6, "go")
-        self.s.join(self.eid, 1, "no")
-        offer = self.s.entry(self.eid, 5)
-        self.assertEqual(offer["status"], "offered")
-        self.assertEqual(self.s.join(self.eid, 7, "go"), "ready")
-        self.s.answer_offer(self.eid, 5, offer["offer_version"], True)
-        self.assertEqual(self.s.entry(self.eid, 5)["status"], "confirmed")
+        self.s.join(self.eid, 5, 'go')
+        self.s.join(self.eid, 6, 'go')
+        self.s.join(self.eid, 1, 'no')
+        self.assertEqual(self.s.entry(self.eid, 5)['status'], 'ready')
+        self.assertEqual(self.s.join(self.eid, 7, 'go'), 'confirmed')
+        self.assertEqual(self.s.join(self.eid, 5, 'go'), 'ready')
         with self.assertRaises(RuleError):
-            self.s.answer_offer(self.eid, 5, offer["offer_version"], True)
+            self.s.answer_offer(self.eid,5,1,True)
 
-    def test_offer_expiry_goes_to_next(self):
+    def test_waiting_does_not_expire_or_change_readiness(self):
         self.fill()
-        self.s.join(self.eid, 5, "go")
-        self.now += 1
-        self.s.join(self.eid, 6, "go")
-        self.s.join(self.eid, 1, "no")
+        self.s.join(self.eid,5,'go')
+        self.s.join(self.eid,1,'no')
         self.now += 1801
         self.s.tick()
-        self.assertEqual(self.s.entry(self.eid, 5)["status"], "unsure")
-        self.assertEqual(self.s.entry(self.eid, 6)["status"], "offered")
+        self.assertEqual(self.s.entry(self.eid,5)['status'],'ready')
 
     def test_unsure_not_promoted(self):
         self.s.join(self.eid, 5, "queue")
@@ -110,7 +104,7 @@ class DomainTests(unittest.TestCase):
         self.now += 10
         self.s.join(self.eid, 5, "go")
         self.s.join(self.eid, 1, "no")
-        self.assertEqual(self.s.entry(self.eid, 6)["status"], "offered")
+        self.assertEqual(self.s.entry(self.eid, 6)["status"], "ready")
 
     def test_payment_retained_after_cancellation_private(self):
         self.s.join(self.eid, 1, "go")
@@ -744,7 +738,7 @@ class DomainTests(unittest.TestCase):
         self.assertEqual(len(restored.event_rating_changes(self.eid)), 2)
 
     def test_level_start_midpoints_and_registration_cannot_reset_seed(self):
-        mapping = {"D":1.5,"D+":2.25,"C":2.75,"C+":3.25,"B-":4.50,"B":4.00,"B+":5.25,"A":6.5}
+        mapping = {"D":1.5,"D+":2.25,"C":2.75,"C+":3.25,"B-":4.00,"B":4.50,"B+":5.25,"A":6.5}
         for uid,(level,value) in enumerate(mapping.items(), start=101):
             self.s.touch_user({"id":uid,"first_name":level}, True)
             self.s.register(uid, "", level)
@@ -767,7 +761,7 @@ class DomainTests(unittest.TestCase):
         self.s.save_results(999, eid, {1:1,2:2}, [1,2], {})
         history = self.s.event_rating_changes(eid)
         self.assertEqual(history[1]["before_rating"], 1.5)
-        self.assertEqual(history[2]["before_rating"], 4.00)
+        self.assertEqual(history[2]["before_rating"], 4.50)
         self.assertGreater(history[1]["delta"], 0.19)
         # A later letter correction does not reset established competitive history.
         before = self.s.rating_profile(1)["rating"]
@@ -826,8 +820,8 @@ class DomainTests(unittest.TestCase):
             c.execute("INSERT OR REPLACE INTO settings VALUES('rating_algorithm',?)", (json.dumps("community-v2-level-seeds"),))
         migrated = Store(self.path, lambda: self.now)
         history = migrated.event_rating_changes(self.eid)
-        self.assertEqual(history[1]["before_rating"], 4.0)
-        self.assertEqual(history[2]["before_rating"], 4.5)
+        self.assertEqual(history[1]["before_rating"], 4.5)
+        self.assertEqual(history[2]["before_rating"], 4.0)
         first = migrated.rating_profile(1)["rating"]
         self.assertGreater(first, 4.1)
         restarted = Store(self.path, lambda: self.now)
@@ -836,8 +830,8 @@ class DomainTests(unittest.TestCase):
 
     def test_letter_thresholds_gaps_and_display_rounding(self):
         cases = [(0,"D"),(1.99,"D"),(2.0,"D+"),(2.49,"D+"),(2.5,"C"),
-                 (2.99,"C"),(3.0,"C+"),(3.5,"C+"),(3.99,"C+"),(4.0,"B"),
-                 (4.49,"B"),(4.5,"B-"),(4.99,"B-"),(5.0,"B+"),(5.5,"B+"),
+                 (2.99,"C"),(3.0,"C+"),(3.5,"C+"),(3.99,"C+"),(4.0,"B-"),
+                 (4.49,"B-"),(4.5,"B"),(4.99,"B"),(5.0,"B+"),(5.5,"B+"),
                  (5.99,"B+"),(6.0,"A"),(8.0,"A"),(2.499,"C")]
         for rating, expected in cases:
             self.assertEqual(level_for_rating(rating), expected)
@@ -929,10 +923,11 @@ class DomainTests(unittest.TestCase):
     def test_unregistered_group_click_opens_registration_without_changing_entry(self):
         self.app.callback(self.group_query(f"go:{self.eid}", 101))
         self.assertIsNone(self.s.entry(self.eid, 101))
-        self.assertIn(f"ego_{self.eid}", self.api.calls[-1][1]["url"])
+        self.assertTrue(self.api.calls[-1][1]["show_alert"])
+        self.assertIn("Открыть бота", self.api.calls[-1][1]["text"])
         self.assertFalse(any(m == "sendMessage" for m,p in self.api.calls))
         self.app.callback(self.group_query("ranking:all:0", 101))
-        self.assertIn("start=register", self.api.calls[-1][1]["url"])
+        self.assertTrue(self.api.calls[-1][1]["show_alert"])
 
     def test_group_roster_only_sent_privately_and_popup_rating_has_no_chat_output(self):
         self.s.join(self.eid, 1, "go")
@@ -960,16 +955,16 @@ class DomainTests(unittest.TestCase):
         finally:
             self.api.send = original
         self.assertEqual(self.s.entry(self.eid, 1)["status"], "confirmed")
-        self.assertIn(f"eno_{self.eid}", self.api.calls[-1][1]["url"])
+        self.assertTrue(self.api.calls[-1][1]["show_alert"])
 
-    def test_group_offer_needs_consent_and_outside_group_cannot_mutate(self):
+    def test_group_free_place_needs_no_reservation_and_outside_group_cannot_mutate(self):
         self.fill()
         self.s.join(self.eid, 5, "go")
         self.s.join(self.eid, 1, "no")
-        self.assertEqual(self.s.entry(self.eid, 5)["status"], "offered")
+        self.assertEqual(self.s.entry(self.eid, 5)["status"], "ready")
         self.app.callback(self.group_query(f"go:{self.eid}", 5))
-        self.assertEqual(self.s.entry(self.eid, 5)["status"], "offered")
-        self.assertTrue(any(m == "sendMessage" and p["chat_id"]==5 for m,p in self.api.calls))
+        self.assertEqual(self.s.entry(self.eid, 5)["status"], "confirmed")
+        self.assertTrue(any(m == "answerCallbackQuery" for m,p in self.api.calls))
         with self.assertRaises(RuleError):
             self.app.callback(self.group_query(f"go:{self.eid}", 6, -999))
         self.assertIsNone(self.s.entry(self.eid, 6))
@@ -1072,7 +1067,7 @@ class DomainTests(unittest.TestCase):
         self.app.handle({"callback_query":self.group_query("history:0", 1)})
         self.assertFalse(any(m=="sendMessage" and p["chat_id"]<0 for m,p in self.api.calls))
         self.assertEqual(self.api.calls[-1][0], "answerCallbackQuery")
-        self.assertNotIn("Место: 1 из 2", self.api.calls[-1][1]["text"])
+        self.assertTrue(self.api.calls[-1][1]["show_alert"])
         self.app.personal_history(3)
         self.assertIn("История появится", self.api.calls[-1][1]["text"])
 
