@@ -551,8 +551,89 @@ class DomainTests(unittest.TestCase):
             "data": "profile", "message": {"chat": {"id": 1, "type": "private"}}})
         self.assertIn("Сыграно турниров: 1", self.api.calls[-1][1]["text"])
 
+    def test_results_flow_ties_preview_confirm_and_profile_count(self):
+        self.s.join(self.eid, 1, "go")
+        self.s.join(self.eid, 2, "go")
+        self.app.admin_callback(999, ["complete", str(self.eid)])
+        self.assertEqual(self.s.event(self.eid)["status"], "published")
+        for _ in range(2):
+            session = self.s.session(999)
+            self.app.admin_callback(999, ["placing", session["token"], "1"])
+        session = self.s.session(999)
+        self.assertEqual(self.s.results(self.eid), {})
+        self.assertEqual(session["index"], 2)
+        self.app.admin_callback(999, ["results_save", session["token"]])
+        self.assertEqual(self.s.results(self.eid), {1:1, 2:1})
+        self.assertEqual(self.s.event(self.eid)["status"], "completed")
+        self.assertEqual(self.s.tournaments_played(1), 1)
+        self.assertIn("1 место", self.api.calls[-1][1]["text"])
+        restored = Store(self.path, lambda: self.now)
+        self.assertEqual(restored.results(self.eid), {1:1, 2:1})
+        with self.assertRaises(RuleError):
+            self.app.admin_callback(999, ["results_save", session["token"]])
+
+    def test_results_validate_full_roster_places_and_concurrent_edits(self):
+        self.s.join(self.eid, 1, "go")
+        self.s.join(self.eid, 2, "go")
+        for places in ({1:1}, {1:0,2:1}, {1:3,2:1}, {1:True,2:1}):
+            with self.assertRaises(RuleError):
+                self.s.save_results(999, self.eid, places, [1,2], {})
+        self.assertEqual(self.s.results(self.eid), {})
+        with self.assertRaises(RuleError):
+            self.s.save_results(999, self.eid, {1:1,2:2}, [1], {})
+        self.s.save_results(999, self.eid, {1:1,2:2}, [1,2], {})
+        with self.assertRaises(RuleError):
+            self.s.save_results(999, self.eid, {1:2,2:1}, [1,2], {})
+        self.s.save_results(999, self.eid, {1:2,2:1}, [1,2], {1:1,2:2})
+        self.assertEqual(self.s.results(self.eid), {2:1,1:2})
+        self.assertEqual(self.s.tournaments_played(1), 1)
+
+    def test_automatic_completion_requests_results_once_per_admin(self):
+        self.s.join(self.eid, 1, "go")
+        self.now = self.data["start"] + self.data["duration"]*60 + 1
+        self.s.tick()
+        self.s.tick()
+        requests = [n for n in self.s.due_notifications() if n["kind"] == "results_request"]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["user_id"], 999)
+        self.assertIn(f"complete:{self.eid}", requests[0]["keyboard"])
+        self.app.start_results(999, self.eid)
+        session = self.s.session(999)
+        self.app.record_place(999, session, 1)
+        self.app.admin_callback(999, ["results_save", self.s.session(999)["token"]])
+        self.assertFalse(any(n["kind"] == "results_request" for n in self.s.due_notifications()))
+
+    def test_results_cancel_back_restart_and_unauthorized_access(self):
+        self.s.join(self.eid, 1, "go")
+        self.app.start_results(999, self.eid)
+        initial = self.s.session(999)
+        with self.assertRaises(RuleError):
+            self.app.start_results(1, self.eid)
+        with self.assertRaises(RuleError):
+            self.app.record_place(999, initial, 0)
+        self.app.admin_callback(999, ["placing", initial["token"], "1"])
+        with self.assertRaises(RuleError):
+            self.app.admin_callback(999, ["placing", initial["token"], "1"])
+        session = Store(self.path, lambda: self.now).session(999)
+        self.assertEqual(session["places"], {"1":1})
+        self.app.admin_callback(999, ["results_back", session["token"]])
+        self.assertEqual(self.s.session(999)["index"], 0)
+        self.app.admin_callback(999, ["results_cancel", self.s.session(999)["token"]])
+        self.assertEqual(self.s.event(self.eid)["status"], "published")
+        self.assertEqual(self.s.results(self.eid), {})
+
+    def test_completed_archive_and_results_message_input(self):
+        self.s.join(self.eid, 1, "go")
+        self.app.start_results(999, self.eid)
+        self.app.handle_message({"from": {"id":999,"first_name":"Admin"}, "chat":{"id":999,"type":"private"}, "text":"1"})
+        self.app.admin_callback(999, ["results_save", self.s.session(999)["token"]])
+        self.app.event_list(999, "completed_events")
+        buttons = self.api.calls[-1][1]["reply_markup"]["inline_keyboard"]
+        self.assertEqual(buttons[0][0]["callback_data"], f"ae:{self.eid}")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

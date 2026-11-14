@@ -31,6 +31,10 @@ class Store:
               offer_until REAL, offer_version INTEGER NOT NULL DEFAULT 0,
               paid INTEGER NOT NULL DEFAULT 0, paid_amount INTEGER NOT NULL DEFAULT 0,
               PRIMARY KEY(event_id,user_id));
+            CREATE TABLE IF NOT EXISTS event_results(
+              event_id INTEGER NOT NULL REFERENCES events(id),
+              user_id INTEGER NOT NULL REFERENCES users(id), place INTEGER NOT NULL CHECK(place>0),
+              PRIMARY KEY(event_id,user_id));
             CREATE TABLE IF NOT EXISTS sessions(user_id INTEGER PRIMARY KEY, data TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(
@@ -241,6 +245,42 @@ class Store:
             c.execute("UPDATE events SET status='published',dirty=1 WHERE id=?", (eid,))
             self.audit(c, actor, "publish", eid)
 
+    def results(self, eid):
+        with self.db() as c:
+            return {r["user_id"]: r["place"] for r in c.execute(
+                "SELECT user_id,place FROM event_results WHERE event_id=? ORDER BY place,user_id", (eid,))}
+
+    def save_results(self, actor, eid, places, participants, previous):
+        """Save the full standings and completion atomically; reject concurrent edits."""
+        with self.db() as c:
+            e = self._event(c, eid)
+            if e["status"] not in ("published", "closed", "completed"):
+                raise RuleError("Результаты доступны только для проведённого турнира.")
+            current = {r[0] for r in c.execute("SELECT user_id FROM entries WHERE event_id=? AND status='confirmed'", (eid,))}
+            if current != set(participants):
+                raise RuleError("Состав изменился. Откройте ввод результатов заново.")
+            saved = {r[0]:r[1] for r in c.execute("SELECT user_id,place FROM event_results WHERE event_id=?", (eid,))}
+            if saved != previous:
+                raise RuleError("Другой администратор уже изменил результаты. Откройте их заново.")
+            if set(places) != current or any(type(v) is not int or not 1 <= v <= len(current) for v in places.values()):
+                raise RuleError("Укажите место каждого игрока: от 1 до числа участников.")
+            c.execute("DELETE FROM event_results WHERE event_id=?", (eid,))
+            c.executemany("INSERT INTO event_results(event_id,user_id,place) VALUES(?,?,?)",
+                          [(eid, uid, place) for uid,place in places.items()])
+            c.execute("UPDATE events SET status='completed',dirty=1 WHERE id=?", (eid,))
+            c.execute("UPDATE entries SET status='ready',offer_until=NULL WHERE event_id=? AND status='offered'", (eid,))
+            c.execute("UPDATE outbox SET state='cancelled' WHERE event_id=? AND kind IN ('offer','reminder','results_request') AND state='pending'", (eid,))
+            self.audit(c, actor, "results", [eid, places])
+
+    def request_results(self, c, eid):
+        admins = c.execute("SELECT value FROM settings WHERE key='result_admins'").fetchone()
+        for uid in json.loads(admins[0]) if admins else []:
+            self.enqueue(c, f"results_request:{eid}:{uid}", uid,
+                         f"Турнир №{eid} завершён. Введите итоговые места участников в админке этого турнира.",
+                         "results_request", eid, keyboard={"inline_keyboard": [[
+                             {"text": "Ввести результаты", "callback_data": f"complete:{eid}"},
+                             {"text": "Открыть турнир", "callback_data": f"ae:{eid}"}]]})
+
     def change_status(self, actor, eid, status):
         if status not in ("closed", "cancelled", "completed"):
             raise RuleError("Неизвестный статус.")
@@ -393,6 +433,7 @@ class Store:
                 self._fill(c, eid)
                 if now >= e["start"] + e["duration"] * 60:
                     c.execute("UPDATE events SET status='completed',dirty=1 WHERE id=?", (eid,))
+                    self.request_results(c, eid)
                     continue
                 for en in c.execute("SELECT * FROM entries WHERE event_id=? AND status='confirmed'", (eid,)).fetchall():
                     for hours in (24, 12, 2, 1):
@@ -444,5 +485,6 @@ class Store:
     def backup(self, target):
         with sqlite3.connect(self.path) as src, sqlite3.connect(target) as dst:
             src.backup(dst)
+
 
 

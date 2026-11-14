@@ -99,6 +99,7 @@ class App:
     def __init__(self, store, api, owner, admins=(), group=None, username=None, levels=None):
         self.s, self.api, self.owner = store, api, owner
         self.admins = set(admins) | {owner}
+        self.s.setting("result_admins", sorted(self.admins))
         self.group = group
         self.username = username or "padel_escape_bot"
         self.levels = levels or DEFAULT_LEVELS
@@ -255,9 +256,10 @@ class App:
         now = self.s.clock()
         events = []
         for e in self.s.events():
-            if mode in ("admin_events", "drafts", "trash", "copy_events"):
+            if mode in ("admin_events", "drafts", "trash", "copy_events", "completed_events"):
                 if ((mode == "drafts" and e["status"] == "draft") or
                     (mode == "trash" and e["status"] == "trash") or
+                    (mode == "completed_events" and e["status"] == "completed") or
                     (mode == "copy_events" and e["status"] != "trash") or
                     (mode == "admin_events" and e["status"] in ("published", "closed"))):
                     events.append(e)
@@ -275,7 +277,7 @@ class App:
         rows = []
         for e in events[page*10:(page+1)*10]:
             dt = datetime.fromtimestamp(e["start"], TZ).strftime("%d.%m %H:%M") if e.get("start") else "Без даты"
-            prefix = "copy" if mode == "copy_events" else "ae" if mode in ("admin_events", "drafts", "trash") else "event"
+            prefix = "copy" if mode == "copy_events" else "ae" if mode in ("admin_events", "drafts", "trash", "completed_events") else "event"
             rows.append([(f"№{e['id']} · {dt} · {(e.get('court') or 'Без названия')[:30]}", f"{prefix}:{e['id']}")])
         nav = []
         if page:
@@ -299,6 +301,7 @@ class App:
         self.send(uid, "<b>Административная панель</b>", kb([
             [("Создать турнир", "new"), ("Турниры", "admin_events")],
             [("Черновики", "drafts"), ("Корзина", "trash")],
+            [("Завершённые / результаты", "completed_events")],
             [("Копировать турнир", "copy_events")],
             [("Участники", "users:0"), ("Задачи", "tasks")],
             [("Рассылка", "broadcast"), ("Закреп регистрации", "registration_post")],
@@ -314,6 +317,15 @@ class App:
                     if e["status"] == "draft" else
                     [[("Восстановить", f"restore_draft:{eid}"), ("Удалить навсегда", f"delete_draft:{eid}")]])
             self.send(uid, self.card_text(e), kb(rows))
+            return
+        if e["status"] == "completed":
+            places = self.s.results(eid)
+            label = "Изменить результаты" if places else "Ввести результаты"
+            self.send(uid, self.card_text(e))
+            self.send(uid, self.results_text(eid, places), kb([
+                [(label, f"complete:{eid}")],
+                [("Игроки / оплаты", f"participants:{eid}:0"), ("Копировать", f"copy:{eid}")],
+                [("Завершённые турниры", "completed_events")]]))
             return
         entries = self.s.entries(eid)
         active = [r for r in entries if r["status"] == "confirmed"]
@@ -380,6 +392,78 @@ class App:
                      [("В основной состав", f"move:{eid}:{target}:go")],
                      [("В неуверенные", f"move:{eid}:{target}:queue"), ("Не идёт", f"move:{eid}:{target}:no")]]
         self.send(uid, text, kb(rows))
+
+    def results_text(self, eid, places):
+        names = {r["user_id"]: r["display"] for r in self.s.entries(eid)}
+        if not places:
+            return "<b>Итоговые места пока не указаны.</b>"
+        rows = ["<b>🏆 Результаты турнира</b>"]
+        for uid, place in sorted(places.items(), key=lambda item: (item[1], item[0])):
+            name = names.get(uid, "Игрок").replace("@", "＠")
+            short = name
+            while len(esc(short)) > 100:
+                short = short[:-1]
+            label = esc(short) + ("…" if short != name else "")
+            rows.append(f"{place} место — {label}")
+        return "\n".join(rows)
+
+    def start_results(self, uid, eid):
+        self.admin(uid)
+        e = self.s.event(eid)
+        if e["status"] not in ("published", "closed", "completed"):
+            raise RuleError("Этот турнир нельзя завершить или изменить его результаты.")
+        self.pause_wizard(uid)
+        participants = [r["user_id"] for r in self.s.entries(eid) if r["status"] == "confirmed"]
+        previous = self.s.results(eid)
+        self.results_prompt(uid, {"kind": "results", "eid": eid, "participants": participants,
+                                 "places": {str(k):v for k,v in previous.items()},
+                                 "previous": {str(k):v for k,v in previous.items()}, "index": 0})
+
+    def results_prompt(self, uid, session):
+        import secrets
+        session["token"] = secrets.token_hex(4)
+        token = session["token"]
+        eid = session["eid"]
+        participants = session["participants"]
+        index = session["index"]
+        rows = []
+        if index < len(participants):
+            names = {r["user_id"]: r["display"] for r in self.s.entries(eid)}
+            target = participants[index]
+            text = (f"🏆 Турнир №{eid} · итоги {index+1}/{len(participants)}\n"
+                    f"Какое место занял(а) {esc(names.get(target, 'Игрок'))}?\n"
+                    "Выберите кнопку или введите номер места сообщением.\n"
+                    "Одинаковые места допустимы, например для игроков одной пары.")
+            options = [(str(n), f"placing:{token}:{n}") for n in range(1, len(participants)+1)]
+            rows = [options[i:i+4] for i in range(0, len(options), 4)]
+            if str(target) in session["places"]:
+                text += f"\nСохранённое в форме место: {session['places'][str(target)]}"
+        else:
+            places = {int(k):v for k,v in session["places"].items()}
+            text = f"Турнир №{eid} · проверьте итоговые места\n\n" + self.results_text(eid, places)
+            text += "\n\nПодтверждение сохранит результаты и завершит турнир."
+            rows.append([("Подтвердить результаты", f"results_save:{token}")])
+        if index > 0:
+            rows.append([("Назад", f"results_back:{token}")])
+        rows.append([("Отмена", f"results_cancel:{token}")])
+        self.s.session(uid, session)
+        self.send(uid, text, kb(rows))
+
+    def results_session(self, uid, token=None):
+        self.admin(uid)
+        session = self.s.session(uid)
+        if not session or session.get("kind") != "results" or (token and session.get("token") != token):
+            raise RuleError("Эта форма результатов устарела. Откройте турнир в админке заново.")
+        return session
+
+    def record_place(self, uid, session, place):
+        count = len(session["participants"])
+        if not 1 <= place <= count or session["index"] >= count:
+            raise RuleError(f"Введите номер места от 1 до {count}.")
+        target = session["participants"][session["index"]]
+        session["places"][str(target)] = place
+        session["index"] += 1
+        self.results_prompt(uid, session)
 
     def persist_wizard(self, uid, session):
         # New drafts live in events; edits of published cards are staged in durable sessions.
@@ -693,7 +777,13 @@ class App:
             self.level_prompt(uid)
             return
         self.admin(uid)
-        if kind == "wizard":
+        if kind == "results":
+            try:
+                place = int(text)
+            except ValueError:
+                raise RuleError("Введите место числом или выберите кнопку.") from None
+            self.record_place(uid, session, place)
+        elif kind == "wizard":
             key = FIELDS[session["index"]][0]
             value = self.parse_field(key, m, session["data"])
             session["data"][key] = value
@@ -779,7 +869,7 @@ class App:
         elif action in ("events", "mine", "waiting"):
             self.event_list(uid, action)
         elif action == "eventpage":
-            if parts[1] in ("admin_events", "drafts", "trash", "copy_events"):
+            if parts[1] in ("admin_events", "drafts", "trash", "copy_events", "completed_events"):
                 self.admin(uid)
             elif parts[1] not in ("events", "mine", "waiting"):
                 raise RuleError("Неизвестный раздел.")
@@ -838,7 +928,7 @@ class App:
         a = p[0]
         if a == "admin":
             self.admin_menu(uid)
-        elif a in ("admin_events", "drafts", "trash", "copy_events"):
+        elif a in ("admin_events", "drafts", "trash", "copy_events", "completed_events"):
             self.event_list(uid, a)
         elif a == "new":
             self.pause_wizard(uid)
@@ -861,11 +951,34 @@ class App:
                 raise RuleError("Дайте боту права администратора в подключённой группе.")
             self.s.publish(uid, eid)
             self.send(uid, "Турнир опубликован. Карточка отправляется в группу.")
-        elif a in ("close", "complete", "cancel_event"):
+        elif a == "complete":
+            self.start_results(uid, int(p[1]))
+        elif a in ("placing", "results_save", "results_back", "results_cancel"):
+            session = self.results_session(uid, p[1])
+            if a == "placing":
+                self.record_place(uid, session, int(p[2]))
+            elif a == "results_back":
+                session["index"] = max(0, session["index"]-1)
+                self.results_prompt(uid, session)
+            elif a == "results_cancel":
+                self.s.session(uid, clear=True)
+                self.admin_event(uid, session["eid"])
+            else:
+                if session["index"] != len(session["participants"]):
+                    raise RuleError("Сначала укажите места всех участников.")
+                self.s.save_results(uid, session["eid"], {int(k):v for k,v in session["places"].items()},
+                                    session["participants"], {int(k):v for k,v in session["previous"].items()})
+                self.s.session(uid, clear=True)
+                self.send(uid, "Результаты сохранены. Турнир завершён, счётчики сыгранных турниров обновлены.")
+                self.admin_event(uid, session["eid"])
+        elif a in ("close", "cancel_event"):
             eid = int(p[1])
             self.send(uid, "Подтвердить изменение статуса турнира?",
                       kb([[("Подтвердить", f"status_yes:{eid}:{a}"), ("Отмена", "admin")]]))
         elif a == "status_yes":
+            if p[2] == "complete":
+                self.start_results(uid, int(p[1]))
+                return
             status = {"close": "closed", "complete": "completed", "cancel_event": "cancelled"}[p[2]]
             self.s.change_status(uid, int(p[1]), status)
             self.admin_event(uid, int(p[1]))
@@ -1141,5 +1254,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
